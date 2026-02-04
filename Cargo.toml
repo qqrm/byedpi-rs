@@ -35,3 +35,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[profile.dev]
+# 0 = allow, 1 = warn, 2 = deny, 3 = forbid
+# This keeps build output quieter while you iterate.
+rustflags = ["-Awarnings"]
