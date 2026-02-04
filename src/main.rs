@@ -5,15 +5,11 @@ mod error; // +
 mod log;
 mod params; // +
 
-mod mpool;
+mod extend;
+mod mpool; // + // +
 
+mod desync; // +
 mod proxy; // +
-mod desync {
-    mod auto_cache;
-    mod engine;
-    mod fake;
-    mod ttl;
-}
 
 fn main() {
     println!("Hello, world!");

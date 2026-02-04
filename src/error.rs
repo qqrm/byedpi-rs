@@ -18,7 +18,7 @@ pub const LOG_L: i32 = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
     Eintr,
-    Eagain,
+    EAGAIN,
     Etimedout,
     Enetunreach,
     EHOSTUNREACH,
@@ -31,7 +31,7 @@ impl Errno {
     pub fn from_raw(v: i32) -> Self {
         match v {
             x if x == libc::EINTR => Errno::Eintr,
-            x if x == libc::EAGAIN => Errno::Eagain,
+            x if x == libc::EAGAIN => Errno::EAGAIN,
             x if x == libc::ETIMEDOUT => Errno::Etimedout,
             x if x == libc::ENETUNREACH => Errno::Enetunreach,
             x if x == libc::EHOSTUNREACH => Errno::EHOSTUNREACH,
