@@ -1,20 +1,15 @@
 // src/error.rs
 //
-// Line-by-line style port of error.h.
-// - get_e(): returns errno (unix) or WSAGetLastError mapped to errno-like codes (windows)
-// - uniperror(): prints last OS error (windows: GetLastError; unix: perror-like)
-// - LOG_* + log(): gated by global params.debug (C: params.debug)
-//
-// This expects crate::params::{SockaddrU, PARAMS} to exist (PARAMS = global runtime params).
-// You can stub PARAMS early and wire it later.
+// Compiling Windows-first port of error.h helpers.
+// - get_e_raw / get_e
+// - uniperror
+// - LOG levels + log()
+// - addr_to_str: Unix uses inet_ntop; Windows uses WSAAddressToStringA (no libc inet_ntop there)
 
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
 
 use crate::params::{PARAMS, SockaddrU};
-
-#[cfg(not(windows))]
-use std::ffi::CStr;
 
 pub const LOG_E: i32 = -1;
 pub const LOG_S: i32 = 1;
@@ -22,10 +17,10 @@ pub const LOG_L: i32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Errno {
-    EINTR,
-    EAGAIN,
-    ETIMEDOUT,
-    ENETUNREACH,
+    Eintr,
+    Eagain,
+    Etimedout,
+    Enetunreach,
     EHOSTUNREACH,
     ECONNREFUSED,
     ECONNRESET,
@@ -33,25 +28,12 @@ pub enum Errno {
 }
 
 impl Errno {
-    pub fn as_raw(self) -> i32 {
-        match self {
-            Errno::EINTR => libc::EINTR,
-            Errno::EAGAIN => libc::EAGAIN,
-            Errno::ETIMEDOUT => libc::ETIMEDOUT,
-            Errno::ENETUNREACH => libc::ENETUNREACH,
-            Errno::EHOSTUNREACH => libc::EHOSTUNREACH,
-            Errno::ECONNREFUSED => libc::ECONNREFUSED,
-            Errno::ECONNRESET => libc::ECONNRESET,
-            Errno::Other(v) => v,
-        }
-    }
-
     pub fn from_raw(v: i32) -> Self {
         match v {
-            x if x == libc::EINTR => Errno::EINTR,
-            x if x == libc::EAGAIN => Errno::EAGAIN,
-            x if x == libc::ETIMEDOUT => Errno::ETIMEDOUT,
-            x if x == libc::ENETUNREACH => Errno::ENETUNREACH,
+            x if x == libc::EINTR => Errno::Eintr,
+            x if x == libc::EAGAIN => Errno::Eagain,
+            x if x == libc::ETIMEDOUT => Errno::Etimedout,
+            x if x == libc::ENETUNREACH => Errno::Enetunreach,
             x if x == libc::EHOSTUNREACH => Errno::EHOSTUNREACH,
             x if x == libc::ECONNREFUSED => Errno::ECONNREFUSED,
             x if x == libc::ECONNRESET => Errno::ECONNRESET,
@@ -60,7 +42,6 @@ impl Errno {
     }
 }
 
-// C: static int unie(int e) { switch (WSA...) return errno-like; }
 #[inline]
 pub fn unie(e: i32) -> i32 {
     #[cfg(windows)]
@@ -101,7 +82,6 @@ pub fn get_e() -> Errno {
     Errno::from_raw(get_e_raw())
 }
 
-// C: uniperror(str)
 pub fn uniperror(s: &str) {
     #[cfg(windows)]
     unsafe {
@@ -111,36 +91,26 @@ pub fn uniperror(s: &str) {
 
     #[cfg(not(windows))]
     unsafe {
-        // perror(str)
         let cs =
             std::ffi::CString::new(s).unwrap_or_else(|_| std::ffi::CString::new("<bad>").unwrap());
         libc::perror(cs.as_ptr());
     }
 }
 
-// C: LOG(s, str, ...) gated by params.debug >= s (non-android)
 #[inline]
 pub fn log(level: i32, msg: &str) {
-    // SAFETY: mirrors C global `params.debug`.
     let dbg = unsafe { PARAMS.debug };
     if dbg >= level {
         eprint!("{}", msg);
     }
 }
 
-#[inline]
-pub fn log_enabled() -> bool {
-    let dbg = unsafe { PARAMS.debug };
-    dbg >= LOG_S
-}
-
-// C: INIT_ADDR_STR(dst) -> inet_ntop into ADDR_STR
+#[cfg(not(windows))]
 pub fn addr_to_str(dst: &SockaddrU) -> Option<String> {
-    // SockaddrU is a union in C; in Rust you’ll likely represent it as enum or repr(C) union.
-    // This implementation assumes SockaddrU provides a method `.as_sockaddr()` returning (&sockaddr, len).
-    let (sa, salen) = dst.as_sockaddr();
+    use std::ffi::CStr;
 
-    let mut buf = [0u8; libc::INET6_ADDRSTRLEN as usize];
+    let (sa, _salen) = dst.as_sockaddr();
+    let mut buf = [0u8; 46]; // INET6_ADDRSTRLEN = 46
 
     let (af, src_ptr) = unsafe {
         match (*sa).sa_family as i32 {
@@ -172,11 +142,38 @@ pub fn addr_to_str(dst: &SockaddrU) -> Option<String> {
     Some(cstr.to_string_lossy().into_owned())
 }
 
-// C: INIT_HEX_STR(b, s)
+#[cfg(windows)]
+pub fn addr_to_str(dst: &SockaddrU) -> Option<String> {
+    use windows_sys::Win32::Networking::WinSock::{SOCKADDR, WSAAddressToStringA};
+
+    let (sa, salen) = dst.as_sockaddr();
+    let sa = sa as *mut SOCKADDR;
+
+    let mut out = [0u8; 128];
+    let mut outlen: u32 = out.len() as u32;
+
+    let rc = unsafe {
+        WSAAddressToStringA(
+            sa,
+            salen as u32,
+            core::ptr::null_mut(),
+            out.as_mut_ptr().cast(),
+            &mut outlen,
+        )
+    };
+    if rc != 0 || outlen == 0 {
+        return None;
+    }
+
+    // outlen includes terminating NUL
+    let s = String::from_utf8_lossy(&out[..(outlen as usize).saturating_sub(1)]).into_owned();
+    Some(s)
+}
+
 pub fn hex_str(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len() * 2);
     for &x in b {
-        use std::fmt::Write;
+        use core::fmt::Write;
         let _ = write!(&mut out, "{:02x}", x);
     }
     out

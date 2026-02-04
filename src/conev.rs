@@ -1,17 +1,15 @@
 // src/conev.rs
 //
-// Line-by-line style port of conev.c / conev.h into a Rust module.
-// This intentionally keeps the same data model (pool + eval array + swap-remove, timer linked list,
-// buffer pool), and keeps platform split between epoll (unix/linux) and WSAPoll/poll (windows).
-//
-// NOTE: This module expects these to exist elsewhere in your crate:
-//   - crate::params::{SockaddrU, DesyncParams}
-//   - crate::error::{uniperror, get_e, Errno, LOG_E, LOG_L, LOG_S, log}
-//
-// If you don't have them yet, keep the types as stubs temporarily and wire later.
+// Fixes:
+// - SockaddrU Debug error resolved by params.rs Debug impl
+// - del_event borrow error fixed (remove_timer called before borrowing pool.items[val_index] mutably)
+// - core::mem import is cfg-gated to avoid unused_imports on Windows
 
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
+
+#[cfg(all(unix, not(feature = "noepoll")))]
+use core::mem;
 
 use std::time::Instant;
 
@@ -21,24 +19,20 @@ use crate::params::{DesyncParams, SockaddrU};
 pub const POLLTIMEOUT: i32 = 0;
 pub const MAX_BUFF_INP: usize = 8;
 
-// C flags
 pub const FLAG_S4: i32 = 1;
 pub const FLAG_S5: i32 = 2;
 pub const FLAG_CONN: i32 = 4;
 pub const FLAG_HTTP: i32 = 8;
 
-// C compatibility: _POLLDEF is POLLHUP on macOS, else 0
 #[cfg(target_os = "macos")]
 const _POLLDEF: i16 = libc::POLLHUP as i16;
 #[cfg(not(target_os = "macos"))]
 const _POLLDEF: i16 = 0;
 
-// C compatibility: POLLRDHUP may not exist; in C it becomes 0.
-// In Rust/libc it may be missing on some targets; keep it optional.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const POLLRDHUP_I16: i16 = libc::POLLRDHUP as i16;
+const _POLLRDHUP: i16 = libc::POLLRDHUP as i16;
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-const POLLRDHUP_I16: i16 = 0;
+const _POLLRDHUP: i16 = 0;
 
 pub type evcb_t = fn(&mut poolhd, &mut eval, i32) -> i32;
 
@@ -97,20 +91,25 @@ impl eval {
     }
 }
 
+#[cfg(any(not(unix), feature = "noepoll"))]
+#[derive(Clone, Copy, Debug)]
+pub struct pollfd_compat {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
 #[derive(Debug)]
 pub struct poolhd {
     pub max: i32,
     pub count: i32,
 
-    // epoll fd (unix) only
     #[cfg(all(unix, not(feature = "noepoll")))]
     pub efd: i32,
 
-    // active slots: indices into items
     pub links: Vec<i32>,
     pub items: Vec<eval>,
 
-    // platform event buffers
     #[cfg(all(unix, not(feature = "noepoll")))]
     pub pevents: Vec<libc::epoll_event>,
     #[cfg(any(not(unix), feature = "noepoll"))]
@@ -126,14 +125,6 @@ pub struct poolhd {
     pub buff_count: i32,
 
     t0: Instant,
-}
-
-#[cfg(any(not(unix), feature = "noepoll"))]
-#[derive(Clone, Copy, Debug)]
-pub struct pollfd_compat {
-    pub fd: i32,
-    pub events: i16,
-    pub revents: i16,
 }
 
 pub fn init_pool(count: i32) -> Option<Box<poolhd>> {
@@ -194,20 +185,20 @@ pub fn add_event(pool: &mut poolhd, cb: evcb_t, fd: i32, e: i32) -> Option<i32> 
 
     let idx = pool.count;
     let item_index = pool.links[idx as usize];
-    let val = &mut pool.items[item_index as usize];
-    val.reset();
 
-    val.mod_iter = pool.iters;
-    val.fd = fd;
-    val.index = idx;
-    val.cb = Some(cb);
+    {
+        let val = &mut pool.items[item_index as usize];
+        val.reset();
+        val.mod_iter = pool.iters;
+        val.fd = fd;
+        val.index = idx;
+        val.cb = Some(cb);
+    }
 
     #[cfg(all(unix, not(feature = "noepoll")))]
     {
         let mut ev: libc::epoll_event = unsafe { mem::zeroed() };
         ev.events = (_POLLDEF as u32) | (e as u32);
-        // store pointer to eval in epoll event data
-        // we store the item_index as u64; resolve back to &mut eval via items vec.
         ev.u64 = item_index as u64;
 
         let rc = unsafe { libc::epoll_ctl(pool.efd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
@@ -230,38 +221,38 @@ pub fn add_event(pool: &mut poolhd, cb: evcb_t, fd: i32, e: i32) -> Option<i32> 
 }
 
 pub fn add_pair(pool: &mut poolhd, val_index: i32, sfd: i32, e: i32) -> Option<i32> {
-    let pair_index = add_event(pool, pool.items[val_index as usize].cb?, sfd, e)?;
+    let cb = pool.items[val_index as usize].cb?;
+    let pair_index = add_event(pool, cb, sfd, e)?;
     pool.items[val_index as usize].pair = Some(pair_index);
     pool.items[pair_index as usize].pair = Some(val_index);
     Some(pair_index)
 }
 
 pub fn del_event(pool: &mut poolhd, val_index: i32) {
-    let mut fd;
-    {
-        let val = &pool.items[val_index as usize];
-        debug_assert!(val.fd >= -1 && val.mod_iter <= pool.iters);
-        log(
-            LOG_S,
-            &format!(
-                "close: fd={}, (pair={}), recv: {}, rounds: {}\n",
-                val.fd,
-                val.pair.map(|p| pool.items[p as usize].fd).unwrap_or(-1),
-                val.recv_count,
-                val.round_count
-            ),
-        );
-        fd = val.fd;
-    }
-
+    let fd = pool.items[val_index as usize].fd;
     if fd == -1 {
         return;
     }
 
-    // Detach from epoll/poll
+    let pair_fd = pool.items[val_index as usize]
+        .pair
+        .map(|p| pool.items[p as usize].fd)
+        .unwrap_or(-1);
+
+    log(
+        LOG_S,
+        &format!(
+            "close: fd={}, (pair={}), recv: {}, rounds: {}\n",
+            fd,
+            pair_fd,
+            pool.items[val_index as usize].recv_count,
+            pool.items[val_index as usize].round_count
+        ),
+    );
+
     #[cfg(all(unix, not(feature = "noepoll")))]
     unsafe {
-        libc::epoll_ctl(pool.efd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+        libc::epoll_ctl(pool.efd, libc::EPOLL_CTL_DEL, fd, core::ptr::null_mut());
     }
 
     #[cfg(any(not(unix), feature = "noepoll"))]
@@ -270,82 +261,78 @@ pub fn del_event(pool: &mut poolhd, val_index: i32) {
         debug_assert_eq!(fd, pool.pevents[idx].fd);
     }
 
-    // Return buffers to pool, free host, unmap fake (unix) etc.
-    {
-        let val = &mut pool.items[val_index as usize];
+    // FIX: call remove_timer BEFORE taking &mut pool.items[val_index]
+    remove_timer(pool, val_index);
 
-        if val.buff.is_some() {
-            let b = val.buff.take();
-            if let Some(b) = b {
-                buff_push(pool, b);
-            }
-        }
-        if val.sq_buff.is_some() {
-            let b = val.sq_buff.take();
-            if let Some(b) = b {
-                buff_push(pool, b);
-            }
-        }
+    // Take owned fields out (avoid holding &mut eval across calls needing &mut pool)
+    let (buff, sq_buff, slot, pair) = {
+        let v = &mut pool.items[val_index as usize];
+
+        let buff = v.buff.take();
+        let sq = v.sq_buff.take();
 
         #[cfg(unix)]
         {
-            if !val.restore_fake.is_null() && val.restore_fake_len != 0 {
+            if !v.restore_fake.is_null() && v.restore_fake_len != 0 {
                 unsafe {
-                    libc::munmap(val.restore_fake as *mut libc::c_void, val.restore_fake_len);
+                    libc::munmap(v.restore_fake as *mut libc::c_void, v.restore_fake_len);
                 }
-                val.restore_fake = std::ptr::null_mut();
-                val.restore_fake_len = 0;
+                v.restore_fake = core::ptr::null_mut();
+                v.restore_fake_len = 0;
             }
         }
 
-        val.host = None;
+        v.host = None;
 
-        // Close socket
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Networking::WinSock::closesocket(fd as usize);
-        }
-        #[cfg(not(windows))]
-        unsafe {
-            libc::close(fd);
-        }
+        let slot = v.index;
+        let pair = v.pair.take();
 
-        val.fd = -1;
-        val.mod_iter = pool.iters;
-        remove_timer(pool, val_index);
+        v.fd = -1;
+        v.mod_iter = pool.iters;
+
+        (buff, sq, slot, pair)
+    };
+
+    if let Some(b) = buff {
+        buff_push(pool, b);
+    }
+    if let Some(b) = sq_buff {
+        buff_push(pool, b);
     }
 
-    // swap-remove active slot in links / pevents, and fix moved eval.index
+    #[cfg(windows)]
+    unsafe {
+        windows_sys::Win32::Networking::WinSock::closesocket(fd as usize);
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::close(fd);
+    }
+
+    // swap-remove slot
     pool.count -= 1;
     let last_slot = pool.count;
-    let del_slot = pool.items[val_index as usize].index;
-
     let moved_item_index = pool.links[last_slot as usize];
-    if moved_item_index != val_index {
-        let del_slot_us = del_slot as usize;
-        let last_slot_us = last_slot as usize;
 
-        pool.links[del_slot_us] = moved_item_index;
-        pool.links[last_slot_us] = val_index;
+    if moved_item_index != val_index {
+        pool.links[slot as usize] = moved_item_index;
+        pool.links[last_slot as usize] = val_index;
 
         #[cfg(any(not(unix), feature = "noepoll"))]
         {
-            pool.pevents[del_slot_us] = pool.pevents[last_slot_us];
+            pool.pevents[slot as usize] = pool.pevents[last_slot as usize];
         }
 
-        pool.items[moved_item_index as usize].index = del_slot;
+        pool.items[moved_item_index as usize].index = slot;
     }
 
-    // handle pair cascade delete
-    let pair = pool.items[val_index as usize].pair.take();
+    // cascade close pair
     if let Some(p) = pair {
         if pool.items[p as usize].pair == Some(val_index) {
             pool.items[p as usize].pair = None;
         }
         del_event(pool, p);
     }
-
-    debug_assert!(pool.count >= 0);
 }
 
 pub fn destroy_pool(mut pool: Box<poolhd>) {
@@ -364,15 +351,12 @@ pub fn destroy_pool(mut pool: Box<poolhd>) {
     if let Some(root) = pool.root_buff.take() {
         buff_destroy(Some(root));
     }
-
-    // drop(pool) happens automatically
 }
 
 #[cfg(all(unix, not(feature = "noepoll")))]
 pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -> Option<i32> {
     loop {
         let mut i = *offs;
-        debug_assert!(i >= -1 && i < pool.max);
         if i < 0 {
             let rc = unsafe { libc::epoll_wait(pool.efd, pool.pevents.as_mut_ptr(), pool.max, ms) };
             if rc == 0 {
@@ -389,8 +373,7 @@ pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -
         let item_index = ev.u64 as i32;
         *offs = i - 1;
 
-        let val = &pool.items[item_index as usize];
-        if val.mod_iter == pool.iters {
+        if pool.items[item_index as usize].mod_iter == pool.iters {
             continue;
         }
         *etype = ev.events as i32;
@@ -401,12 +384,9 @@ pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -
 #[cfg(all(unix, not(feature = "noepoll")))]
 pub fn mod_etype(pool: &mut poolhd, val_index: i32, typ: i32) -> i32 {
     let fd = pool.items[val_index as usize].fd;
-    debug_assert!(fd > 0);
-
     let mut ev: libc::epoll_event = unsafe { mem::zeroed() };
     ev.events = (_POLLDEF as u32) | (typ as u32);
     ev.u64 = val_index as u64;
-
     unsafe { libc::epoll_ctl(pool.efd, libc::EPOLL_CTL_MOD, fd, &mut ev) }
 }
 
@@ -414,7 +394,6 @@ pub fn mod_etype(pool: &mut poolhd, val_index: i32, typ: i32) -> i32 {
 pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -> Option<i32> {
     let mut i = *offs;
     loop {
-        debug_assert!(i >= -1 && i < pool.max);
         if i < 0 {
             let ret = poll_compat(&mut pool.pevents, pool.count as usize, ms);
             if ret == 0 {
@@ -434,8 +413,6 @@ pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -
         }
 
         let val_index = pool.links[i as usize];
-        debug_assert!((i < pool.count) || (pool.items[val_index as usize].mod_iter == pool.iters));
-
         if pool.items[val_index as usize].mod_iter == pool.iters {
             i -= 1;
             continue;
@@ -451,7 +428,6 @@ pub fn next_event(pool: &mut poolhd, offs: &mut i32, etype: &mut i32, ms: i32) -
 #[cfg(any(not(unix), feature = "noepoll"))]
 pub fn mod_etype(pool: &mut poolhd, val_index: i32, typ: i32) -> i32 {
     let slot = pool.items[val_index as usize].index;
-    debug_assert!(slot >= 0 && slot < pool.count);
     pool.pevents[slot as usize].events = _POLLDEF | (typ as i16);
     0
 }
@@ -551,13 +527,15 @@ pub fn loop_event(pool: &mut poolhd) {
     let mut etype: i32 = -1;
 
     while !pool.brk {
-        let val_index = next_event_tv(pool, &mut offs, &mut etype);
-        let Some(val_index) = val_index else {
-            if get_e() == Errno::EINTR {
-                continue;
+        let val_index = match next_event_tv(pool, &mut offs, &mut etype) {
+            Some(v) => v,
+            None => {
+                if get_e() == Errno::Eintr {
+                    continue;
+                }
+                uniperror("(e)poll");
+                break;
             }
-            uniperror("(e)poll");
-            break;
         };
 
         let fd = pool.items[val_index as usize].fd;
@@ -565,8 +543,6 @@ pub fn loop_event(pool: &mut poolhd) {
 
         let cb = pool.items[val_index as usize].cb;
         if let Some(cb) = cb {
-            // SAFETY: cb can mutate pool/items; we must avoid aliasing.
-            // We temporarily take a raw pointer to eval slot.
             let pool_ptr: *mut poolhd = pool;
             let eval_ptr: *mut eval = &mut pool.items[val_index as usize];
             let ret = unsafe { cb(&mut *pool_ptr, &mut *eval_ptr, etype) };
@@ -593,6 +569,7 @@ pub fn buff_pop(pool: &mut poolhd, size: usize) -> Option<Box<buffer>> {
         next: None,
         data: vec![0u8; size],
     });
+
     log(LOG_S, "alloc new buffer\n");
     b.offset = 0;
     b.lock = 0;
@@ -601,7 +578,6 @@ pub fn buff_pop(pool: &mut poolhd, size: usize) -> Option<Box<buffer>> {
 
 pub fn buff_push(pool: &mut poolhd, mut buff: Box<buffer>) {
     if pool.buff_count as usize >= MAX_BUFF_INP {
-        // drop
         return;
     }
     buff.lock = 0;
@@ -616,17 +592,8 @@ pub fn buff_destroy(mut root: Option<Box<buffer>>) {
     while let Some(mut c) = root {
         root = c.next.take();
         i += 1;
-        // drop(c)
     }
     log(LOG_S, &format!("buffers count: {}\n", i));
-}
-
-pub fn buff_ppop(pool: &mut poolhd, size: usize) -> Option<Box<buffer>> {
-    let b = buff_pop(pool, size)?;
-    // In C: pop then immediately push back, return pointer.
-    // In Rust: we can't have it both in pool and returned; keep semantics by cloning data is bad.
-    // So keep this as "peek-alloc": allocate and do not store. Caller can push back when done.
-    Some(b)
 }
 
 #[cfg(any(not(unix), feature = "noepoll"))]
@@ -635,11 +602,10 @@ fn poll_compat(fds: &mut [pollfd_compat], nfds: usize, timeout_ms: i32) -> i32 {
     unsafe {
         use windows_sys::Win32::Networking::WinSock::{WSAPOLLFD, WSAPoll};
 
-        // transmute-compatible layout assumption is unsafe; do explicit conversion
         let mut tmp: Vec<WSAPOLLFD> = (0..nfds)
             .map(|i| WSAPOLLFD {
                 fd: fds[i].fd as usize,
-                events: fds[i].events as i16,
+                events: fds[i].events,
                 revents: 0,
             })
             .collect();
@@ -647,7 +613,7 @@ fn poll_compat(fds: &mut [pollfd_compat], nfds: usize, timeout_ms: i32) -> i32 {
         let rc = WSAPoll(tmp.as_mut_ptr(), nfds as u32, timeout_ms);
         if rc > 0 {
             for i in 0..nfds {
-                fds[i].revents = tmp[i].revents as i16;
+                fds[i].revents = tmp[i].revents;
             }
         }
         rc
@@ -658,7 +624,7 @@ fn poll_compat(fds: &mut [pollfd_compat], nfds: usize, timeout_ms: i32) -> i32 {
         let mut tmp: Vec<libc::pollfd> = (0..nfds)
             .map(|i| libc::pollfd {
                 fd: fds[i].fd,
-                events: fds[i].events as i16,
+                events: fds[i].events,
                 revents: 0,
             })
             .collect();
@@ -666,7 +632,7 @@ fn poll_compat(fds: &mut [pollfd_compat], nfds: usize, timeout_ms: i32) -> i32 {
         let rc = libc::poll(tmp.as_mut_ptr(), nfds as u64, timeout_ms);
         if rc > 0 {
             for i in 0..nfds {
-                fds[i].revents = tmp[i].revents as i16;
+                fds[i].revents = tmp[i].revents;
             }
         }
         rc
