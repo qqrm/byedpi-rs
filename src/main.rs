@@ -5,13 +5,9 @@ mod error; // +
 mod log;
 mod params; // +
 
-mod net {
-    mod addr;
-    mod dns;
-    mod sock;
-}
+mod mpool;
 
-mod proxy;
+mod proxy; // +
 mod desync {
     mod auto_cache;
     mod engine;

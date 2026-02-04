@@ -1,7 +1,7 @@
 // src/params.rs
 //
-// Minimal, compiling Windows-first port of params.h data definitions.
-// Fixes: SockaddrU now implements Debug (manual), so structs containing it can derive Debug.
+// Update: replace the previous mphdr stub with real structs used by mpool.{c,h}.
+// This is required so other modules can reference mphdr/elem definitions.
 
 #![allow(dead_code)]
 #![allow(non_camel_case_types)]
@@ -13,6 +13,13 @@ use libc::{sockaddr, sockaddr_in, sockaddr_in6};
 
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6};
+
+pub const CMP_BYTES: u8 = 0;
+pub const CMP_BITS: u8 = 1;
+pub const CMP_HOST: u8 = 2;
+
+pub const MF_STATIC: u16 = 1;
+pub const MF_EXTRA: u16 = 2;
 
 pub const OFFSET_END: i32 = 1;
 pub const OFFSET_MID: i32 = 2;
@@ -52,7 +59,6 @@ pub union SockaddrU {
     pub in_: sockaddr_in,
     #[cfg(not(windows))]
     pub in6: sockaddr_in6,
-
     #[cfg(windows)]
     pub sa: SOCKADDR,
     #[cfg(windows)]
@@ -69,8 +75,6 @@ impl Default for SockaddrU {
 
 impl fmt::Debug for SockaddrU {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // No allocations, no inet_ntop/WSAAddressToString here (avoid module deps).
-        // Just show family and raw bytes length.
         #[cfg(not(windows))]
         unsafe {
             let fam = self.sa.sa_family as i32;
@@ -79,7 +83,6 @@ impl fmt::Debug for SockaddrU {
                 .field("sa_family", &fam)
                 .finish();
         }
-
         #[cfg(windows)]
         unsafe {
             let fam = self.sa.sa_family as i32;
@@ -92,7 +95,6 @@ impl fmt::Debug for SockaddrU {
 }
 
 impl SockaddrU {
-    // Used by error::addr_to_str.
     #[cfg(not(windows))]
     pub fn as_sockaddr(&self) -> (*const libc::sockaddr, libc::socklen_t) {
         unsafe {
@@ -110,18 +112,68 @@ impl SockaddrU {
         *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
         i32,
     ) {
-        (
-            ptr::addr_of!(self.sa) as *const SOCKADDR,
-            mem::size_of::<SOCKADDR>() as i32,
-        )
+        unsafe {
+            (
+                ptr::addr_of!(self.sa) as *const SOCKADDR,
+                mem::size_of::<SOCKADDR>() as i32,
+            )
+        }
     }
 }
 
-// mpool.h stub (replace when you port mpool.*)
+#[repr(C)]
+pub struct elem {
+    pub len: i32,
+    pub data: *mut i8,
+    pub cmp_type: u8,
+    // KAVL_HEAD(struct elem) head;  (ignored in Rust port)
+}
+
+#[repr(C)]
+pub struct elem_ex {
+    pub main: elem,
+    pub extra_len: u32,
+    pub extra: *mut i8,
+}
+
+#[repr(C)]
+pub struct elem_i {
+    pub main: elem,
+    pub extra_len: u32,
+    pub extra: *mut i8,
+
+    pub dp_mask: u64,
+    pub detect: i32,
+    pub time: i64, // time_t (keep i64)
+    pub time_inc: i32,
+}
+
 #[repr(C)]
 pub struct mphdr {
-    _private: [u8; 0],
+    pub flags: u16,
+    pub cmp_type: u8,
+    pub count: usize,
+    pub root: *mut elem, // unused in Rust port (was KAVL root)
+    // Rust-only storage:
+    pub items: Vec<*mut elem>,
+    // 0=elem, 1=elem_ex, 2=elem_i (used by destroy_elem)
+    pub alloc_kind: u8,
 }
+
+impl Default for mphdr {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            cmp_type: CMP_BYTES,
+            count: 0,
+            root: ptr::null_mut(),
+            items: Vec::new(),
+            alloc_kind: 0,
+        }
+    }
+}
+
+// mpool.h stub in previous versions is now replaced by real mphdr above.
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -139,16 +191,6 @@ pub struct packet {
     pub size: isize, // ssize_t
     pub data: *mut i8,
     pub off: isize,
-}
-
-impl Default for packet {
-    fn default() -> Self {
-        Self {
-            size: 0,
-            data: ptr::null_mut(),
-            off: 0,
-        }
-    }
 }
 
 #[repr(C)]
@@ -197,13 +239,6 @@ pub struct desync_params {
     pub next: *mut desync_params,
 }
 
-impl Default for desync_params {
-    fn default() -> Self {
-        unsafe { mem::zeroed() }
-    }
-}
-
-// Rust-friendly alias names expected by other modules
 pub type DesyncParams = desync_params;
 
 #[repr(C)]
@@ -238,49 +273,8 @@ pub struct params {
     pub cache_file: *const i8,
 }
 
-impl Default for params {
-    fn default() -> Self {
-        unsafe { mem::zeroed() }
-    }
-}
+pub static mut PARAMS: params = unsafe { mem::zeroed() };
 
-// C globals
-pub static mut PARAMS: params = params {
-    dp_n: 0,
-    dp: ptr::null_mut(),
-    await_int: 0,
-    wait_send: false,
-    def_ttl: 0,
-    custom_ttl: false,
-
-    tfo: false,
-    timeout: 0,
-    auto_level: 0,
-    cache_ttl_n: 0,
-    cache_ttl: ptr::null_mut(),
-    ipv6: false,
-    resolve: false,
-    udp: false,
-    transparent: false,
-    http_connect: false,
-    max_open: 0,
-    debug: 0,
-    bfsize: 0,
-    baddr: SockaddrU {
-        sa: unsafe { mem::zeroed() },
-    },
-    laddr: SockaddrU {
-        sa: unsafe { mem::zeroed() },
-    },
-    mempool: ptr::null_mut(),
-
-    protect_path: ptr::null(),
-    pid_file: ptr::null(),
-    pid_fd: -1,
-    cache_file: ptr::null(),
-};
-
-// fake_* packets declared in C
 pub static mut FAKE_TLS: packet = packet {
     size: 0,
     data: ptr::null_mut(),
