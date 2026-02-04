@@ -1,9 +1,9 @@
 mod cli;
 mod conev; // +
 mod config;
-mod error;
+mod error; // +
 mod log;
-mod params;
+mod params; // +
 
 mod net {
     mod addr;
@@ -11,12 +11,7 @@ mod net {
     mod sock;
 }
 
-mod proxy {
-    mod http_connect;
-    mod socks5;
-    mod udp;
-}
-
+mod proxy;
 mod desync {
     mod auto_cache;
     mod engine;

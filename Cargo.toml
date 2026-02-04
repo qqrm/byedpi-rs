@@ -1,3 +1,5 @@
+cargo-features = ["profile-rustflags"]
+
 [package]
 name = "byedpi-rs"
 version = "0.1.0"
@@ -7,6 +9,7 @@ authors = []
 description = "Rust port of ByeDPI"
 repository = ""
 readme = "README.md"
+
 
 [features]
 default = []
@@ -37,6 +40,4 @@ panic = "abort"
 strip = true
 
 [profile.dev]
-# 0 = allow, 1 = warn, 2 = deny, 3 = forbid
-# This keeps build output quieter while you iterate.
 rustflags = ["-Awarnings"]
