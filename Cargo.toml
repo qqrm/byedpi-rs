@@ -2,5 +2,36 @@
 name = "byedpi-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = []
+description = "Rust port of ByeDPI"
+repository = ""
+readme = "README.md"
+
+[features]
+default = []
+# Mirror the C build switches
+noepoll = []           # force poll/WSAPoll path even on unix
+windows-service = []   # enable SCM/service glue
+linux-transparent = [] # SO_ORIGINAL_DST / transparent proxy features
+linux-tfo = []         # TCP Fast Open
+linux-md5sig = []      # TCP_MD5SIG
+linux-drop-sack = []   # SO_ATTACH_FILTER BPF drop_sack
 
 [dependencies]
+libc = "0.2"
+socket2 = "0.6.2"
+
+# Used for WSAPoll/closesocket on Windows (and other Win32 APIs later)
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Networking_WinSock",
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
