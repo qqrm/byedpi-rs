@@ -2,16 +2,23 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::match_single_binding)]
 
+mod conev;
+mod desync;
+mod error;
+mod extend;
 mod mpool;
+mod packets;
 mod params;
+mod proxy;
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self};
 use std::net::{IpAddr, SocketAddr};
+use std::mem;
 use std::str::FromStr;
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::mpool;
 use crate::params::{CMP_BYTES, MF_EXTRA, PARAMS};
@@ -571,12 +578,86 @@ fn parse_offset(part: &mut Part, s: &str) -> Result<(), ()> {
     Ok(())
 }
 
-// ---- program-specific hooks (must be provided by your Rust port of the project) ----
+// ---- program-specific hooks (port wiring) ----
 
-// Replace these with real modules when you port the rest of the C project.
-fn run(_listen: &SocketAddr) -> i32 {
-    // TODO: port proxy main loop
-    0
+fn sockaddru_from_socketaddr(addr: SocketAddr) -> params::SockaddrU {
+    let sock = SockAddr::from(addr);
+    let mut out: params::SockaddrU = unsafe { mem::zeroed() };
+    unsafe {
+        let src = sock.as_ptr() as *const u8;
+        let dst = (&mut out as *mut params::SockaddrU) as *mut u8;
+        std::ptr::copy_nonoverlapping(src, dst, sock.len() as usize);
+    }
+    out
+}
+
+fn sockaddru_from_ipaddr(addr: IpAddr) -> params::SockaddrU {
+    sockaddru_from_socketaddr(SocketAddr::new(addr, 0))
+}
+
+#[cfg(not(windows))]
+struct PidFileGuard {
+    path: Option<std::ffi::CString>,
+    fd: Option<std::os::unix::io::RawFd>,
+}
+
+#[cfg(not(windows))]
+impl PidFileGuard {
+    fn empty() -> Self {
+        Self {
+            path: None,
+            fd: None,
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(fd) = self.fd.take() {
+                libc::close(fd);
+            }
+            if let Some(path) = self.path.as_ref() {
+                libc::unlink(path.as_ptr());
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn init_pid_file(path: &str) -> Result<PidFileGuard, ()> {
+    let c_path = std::ffi::CString::new(path).map_err(|_| ())?;
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o640) };
+    if fd < 0 {
+        return Err(());
+    }
+    let mut lock = libc::flock {
+        l_type: libc::F_WRLCK as i16,
+        l_whence: libc::SEEK_CUR as i16,
+        l_start: 0,
+        l_len: 0,
+        l_pid: 0,
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) } < 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(());
+    }
+    let pid = unsafe { libc::getpid() };
+    let pid_str = pid.to_string();
+    unsafe {
+        libc::write(fd, pid_str.as_ptr().cast(), pid_str.len());
+    }
+    unsafe {
+        PARAMS.pid_fd = fd;
+        PARAMS.pid_file = c_path.as_ptr();
+    }
+    Ok(PidFileGuard {
+        path: Some(c_path),
+        fd: Some(fd),
+    })
 }
 
 // ---- argv parsing (faithful to main.c control flow, including -A/-B rewind) ----
@@ -1228,21 +1309,72 @@ fn real_main(argv: Vec<OsString>) -> Result<i32, String> {
         params.cache_ttl.push(100800);
     }
 
-    // daemon / pidfile placeholders
-    if daemonize {
-        let _ = pid_file; // TODO: implement if needed (unix daemonize + pidfile)
-    }
-
     // cache load
     let mempool = mpool::mem_pool(MF_EXTRA, CMP_BYTES);
     if mempool.is_null() {
         return Err("mem_pool failed".into());
     }
+
+    let laddr = sockaddru_from_socketaddr(params.laddr);
+    let baddr = sockaddru_from_ipaddr(params.baddr);
+    let protect_path = if let Some(path) = &params.protect_path {
+        Some(std::ffi::CString::new(path.as_str()).map_err(|_| "invalid protect path")?)
+    } else {
+        None
+    };
     unsafe {
+        PARAMS.await_int = params.await_int;
+        PARAMS.wait_send = params.wait_send;
+        PARAMS.def_ttl = params.def_ttl as i32;
+        PARAMS.custom_ttl = params.custom_ttl;
+        PARAMS.tfo = params.tfo;
+        PARAMS.timeout = params.timeout_ms.unwrap_or(0);
+        PARAMS.auto_level = params.auto_level as i32;
         PARAMS.cache_ttl_n = params.cache_ttl.len() as i32;
         PARAMS.cache_ttl = params.cache_ttl.as_mut_ptr();
+        PARAMS.ipv6 = params.ipv6;
+        PARAMS.resolve = params.resolve;
+        PARAMS.udp = params.udp;
+        PARAMS.transparent = params.transparent;
+        PARAMS.http_connect = params.http_connect;
+        PARAMS.max_open = params.max_open;
+        PARAMS.debug = params.debug;
+        PARAMS.bfsize = params.bfsize as usize;
+        PARAMS.baddr = baddr;
+        PARAMS.laddr = laddr;
+        PARAMS.protect_path = protect_path
+            .as_ref()
+            .map_or(std::ptr::null(), |p| p.as_ptr());
+        PARAMS.pid_file = std::ptr::null();
+        PARAMS.pid_fd = -1;
         PARAMS.mempool = mempool;
     }
+
+    #[cfg(not(windows))]
+    let mut pid_guard = PidFileGuard::empty();
+    #[cfg(not(windows))]
+    {
+        if daemonize && unsafe { libc::daemon(0, 0) } < 0 {
+            mpool::mem_destroy(mempool);
+            unsafe {
+                PARAMS.mempool = std::ptr::null_mut();
+            }
+            return Ok(-1);
+        }
+        if let Some(pid_path) = &pid_file {
+            match init_pid_file(pid_path) {
+                Ok(guard) => pid_guard = guard,
+                Err(_) => {
+                    mpool::mem_destroy(mempool);
+                    unsafe {
+                        PARAMS.mempool = std::ptr::null_mut();
+                    }
+                    return Ok(-1);
+                }
+            }
+        }
+    }
+
     if let Some(cf) = &params.cache_file {
         if cf != "-" {
             if let Ok(mut f) = fs::File::open(cf) {
@@ -1252,7 +1384,7 @@ fn real_main(argv: Vec<OsString>) -> Result<i32, String> {
     }
 
     // run server
-    let status = run(&params.laddr);
+    let status = unsafe { proxy::run(&PARAMS.laddr) };
 
     // group logging (placeholder; wire to your logging)
     for dp in &params.dp {
@@ -1274,6 +1406,12 @@ fn real_main(argv: Vec<OsString>) -> Result<i32, String> {
     }
 
     mpool::mem_destroy(mempool);
+    unsafe {
+        PARAMS.mempool = std::ptr::null_mut();
+    }
+
+    #[cfg(not(windows))]
+    drop(pid_guard);
 
     Ok(status)
 }
