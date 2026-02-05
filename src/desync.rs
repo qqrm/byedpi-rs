@@ -2,7 +2,7 @@
 //
 // Port of desync.h / desync.c (Windows-first).
 // Notes:
-// - Linux-only optimizations (TCP_INFO notsent bytes, BPF drop_sack, TCP_MD5SIG, splice/vmsplice) are stubbed or simplified.
+// - Linux-only optimizations (TCP_INFO notsent bytes, BPF drop_sack, TCP_MD5SIG, splice/vmsplice) are cfg-gated.
 // - FAKE_SUPPORT is behind feature "fake-support" (off by default).
 //
 // Public API matches C:
@@ -21,8 +21,8 @@ use crate::conev::{self, buffer as CBuffer, eval, poolhd};
 use crate::error::{Errno, LOG_E, LOG_L, LOG_S, get_e, log, uniperror};
 use crate::packets;
 use crate::params::{
-    DesyncParams, OFFSET_END, OFFSET_HOST, OFFSET_MID, OFFSET_RAND, OFFSET_SNI, OFFSET_START,
-    PARAMS, demode, part,
+    DesyncParams, FM_ORIG, FM_RAND, OFFSET_END, OFFSET_HOST, OFFSET_MID, OFFSET_RAND, OFFSET_SNI,
+    OFFSET_START, PARAMS, demode, packet, part,
 };
 
 #[cfg(windows)]
@@ -32,6 +32,8 @@ use windows_sys::Win32::Networking::WinSock::*;
 use libc::*;
 
 const ERR_WAIT: isize = -12;
+#[cfg(target_os = "linux")]
+const DEFAULT_TTL: i32 = 8;
 
 // ---- protocol info ----
 
@@ -197,7 +199,28 @@ pub fn setttl(fd: i32, ttl: i32) -> i32 {
 }
 
 fn restore_state(val: &mut eval) {
-    // Linux-only restore_fake/md5sig is skipped in this stage.
+    #[cfg(target_os = "linux")]
+    {
+        if !val.restore_fake.is_null() && val.restore_fake_len != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    val.restore_orig,
+                    val.restore_fake,
+                    val.restore_orig_len,
+                );
+                libc::munmap(
+                    val.restore_fake as *mut libc::c_void,
+                    val.restore_fake_len,
+                );
+            }
+            val.restore_fake = ptr::null_mut();
+            val.restore_fake_len = 0;
+        }
+        if val.restore_md5 {
+            let _ = set_md5sig(val.fd, 0);
+            val.restore_md5 = false;
+        }
+    }
     if val.restore_ttl {
         unsafe {
             let ttl = PARAMS.def_ttl;
@@ -205,6 +228,343 @@ fn restore_state(val: &mut eval) {
         }
         val.restore_ttl = false;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn drop_sack(fd: i32) -> i32 {
+    let code = [
+        libc::sock_filter {
+            code: 0x30,
+            jt: 0,
+            jf: 0,
+            k: 0x0000000c,
+        },
+        libc::sock_filter {
+            code: 0x74,
+            jt: 0,
+            jf: 0,
+            k: 0x00000004,
+        },
+        libc::sock_filter {
+            code: 0x35,
+            jt: 0,
+            jf: 3,
+            k: 0x0000000b,
+        },
+        libc::sock_filter {
+            code: 0x30,
+            jt: 0,
+            jf: 0,
+            k: 0x00000022,
+        },
+        libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: 0x00000005,
+        },
+        libc::sock_filter {
+            code: 0x6,
+            jt: 0,
+            jf: 0,
+            k: 0x00000000,
+        },
+        libc::sock_filter {
+            code: 0x6,
+            jt: 0,
+            jf: 0,
+            k: 0x00040000,
+        },
+    ];
+    let bpf = libc::sock_fprog {
+        len: code.len() as u16,
+        filter: code.as_ptr() as *mut libc::sock_filter,
+    };
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_FILTER,
+            &bpf as *const _ as *const libc::c_void,
+            mem::size_of_val(&bpf) as libc::socklen_t,
+        )
+    };
+    if rc == -1 {
+        uniperror("setsockopt SO_ATTACH_FILTER");
+        return -1;
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_sack(_fd: i32) -> i32 {
+    0
+}
+
+#[cfg(target_os = "linux")]
+fn sock_has_notsent(sfd: i32) -> bool {
+    let mut tcpi: libc::tcp_info = unsafe { mem::zeroed() };
+    let mut ts = mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            sfd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut tcpi as *mut _ as *mut libc::c_void,
+            &mut ts,
+        )
+    };
+    if rc < 0 {
+        uniperror("getsockopt TCP_INFO");
+        return false;
+    }
+    if tcpi.tcpi_state != libc::TCP_ESTABLISHED as u8 {
+        log(LOG_E, &format!("state: {}\n", tcpi.tcpi_state));
+        return false;
+    }
+    let notsent_offset = core::mem::offset_of!(libc::tcp_info, tcpi_notsent_bytes);
+    if (ts as usize) <= notsent_offset {
+        log(LOG_E, "tcpi_notsent_bytes not provided\n");
+        return false;
+    }
+    tcpi.tcpi_notsent_bytes != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sock_has_notsent(_sfd: i32) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn alloc_pktd(n: usize) -> *mut u8 {
+    let p = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            n,
+            libc::PROT_WRITE | libc::PROT_READ,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        ptr::null_mut()
+    } else {
+        p as *mut u8
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn alloc_pktd(n: usize) -> *mut u8 {
+    unsafe { libc::malloc(n) as *mut u8 }
+}
+
+#[cfg(target_os = "linux")]
+fn set_md5sig(sfd: i32, key_len: u16) -> i32 {
+    let mut md5: libc::tcp_md5sig = unsafe { mem::zeroed() };
+    md5.tcpm_keylen = key_len;
+    let mut addr_size = mem::size_of_val(&md5.tcpm_addr) as libc::socklen_t;
+    let rc = unsafe {
+        libc::getpeername(
+            sfd,
+            &mut md5.tcpm_addr as *mut _ as *mut libc::sockaddr,
+            &mut addr_size,
+        )
+    };
+    if rc < 0 {
+        uniperror("getpeername");
+        return -1;
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            sfd,
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            &md5 as *const _ as *const libc::c_void,
+            mem::size_of_val(&md5) as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        uniperror("setsockopt TCP_MD5SIG");
+        return -1;
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_md5sig(_sfd: i32, _key_len: u16) -> i32 {
+    0
+}
+
+fn get_tcp_fake(buffer: &[u8], info: &mut ProtoInfo, opt: &DesyncParams) -> packet {
+    let mut pkt = if !opt.fake_data.data.is_null() {
+        opt.fake_data
+    } else {
+        if info.type_ == 0 {
+            if packets::is_tls_chello(buffer.as_ptr() as *const i8, buffer.len()) {
+                info.type_ = packets::IS_HTTPS;
+            } else if packets::is_http(buffer.as_ptr() as *const i8, buffer.len()) {
+                info.type_ = packets::IS_HTTP;
+            }
+        }
+        if info.type_ == packets::IS_HTTP {
+            packet {
+                size: packets::HTTP_DATA.len() as isize,
+                data: packets::HTTP_DATA.as_ptr() as *mut i8,
+                off: 0,
+            }
+        } else {
+            packet {
+                size: packets::TLS_DATA.len() as isize,
+                data: packets::TLS_DATA.as_ptr() as *mut i8,
+                off: 0,
+            }
+        }
+    };
+
+    let n = buffer.len() as isize;
+    let ps = if n > pkt.size { n } else { pkt.size };
+    let p = alloc_pktd(ps as usize);
+    if p.is_null() {
+        uniperror("malloc/mmap");
+        pkt.data = ptr::null_mut();
+        return pkt;
+    }
+
+    let mut sni: *const i8 = ptr::null();
+    if opt.fake_sni_count != 0 {
+        let idx = (rand_u32() % (opt.fake_sni_count as u32)) as isize;
+        unsafe {
+            sni = *opt.fake_sni_list.offset(idx);
+        }
+    }
+
+    loop {
+        let mut f_size = opt.fake_tls_size;
+        if f_size < 0 {
+            f_size = n as i32 + f_size;
+        }
+        if f_size > n as i32 || f_size <= 0 {
+            f_size = n as i32;
+        }
+
+        if (opt.fake_mod & FM_ORIG) != 0 && info.type_ == packets::IS_HTTPS {
+            unsafe {
+                ptr::copy_nonoverlapping(buffer.as_ptr(), p, n as usize);
+            }
+            if sni.is_null()
+                || unsafe {
+                    packets::change_tls_sni(sni, p as *mut i8, n, f_size as isize)
+                } != 0
+            {
+                break;
+            }
+            log(LOG_E, "change sni error\n");
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(pkt.data as *const u8, p, pkt.size as usize);
+        }
+        if !sni.is_null()
+            && unsafe {
+                packets::change_tls_sni(sni, p as *mut i8, pkt.size, f_size as isize)
+            } < 0
+        {
+            break;
+        }
+        break;
+    }
+
+    if (opt.fake_mod & FM_RAND) != 0 {
+        unsafe {
+            packets::randomize_tls(p as *mut i8, ps);
+        }
+    }
+    pkt.data = p as *mut i8;
+    pkt.size = ps;
+
+    if opt.fake_offset.m != 0 {
+        let off = gen_offset(
+            opt.fake_offset.pos as i64,
+            opt.fake_offset.flag,
+            buffer,
+            0,
+            info,
+        );
+        pkt.off = off as isize;
+        if pkt.off > pkt.size || pkt.off < 0 {
+            pkt.off = 0;
+        }
+    }
+    pkt
+}
+
+#[cfg(target_os = "linux")]
+fn send_fake(
+    val: &mut eval,
+    buffer: &[u8],
+    pos: isize,
+    opt: &DesyncParams,
+    pkt: packet,
+) -> isize {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        uniperror("pipe");
+        return -1;
+    }
+    let mut ret: isize = -1;
+    val.restore_orig = buffer.as_ptr();
+    val.restore_orig_len = pos as usize;
+
+    loop {
+        let p = unsafe { pkt.data.offset(pkt.off) };
+        val.restore_fake = p as *mut u8;
+        val.restore_fake_len = pkt.size as usize;
+
+        let ttl = if opt.ttl != 0 { opt.ttl } else { DEFAULT_TTL };
+        if setttl(val.fd, ttl) < 0 {
+            break;
+        }
+        val.restore_ttl = true;
+
+        if opt.md5sig && set_md5sig(val.fd, 5) != 0 {
+            break;
+        }
+        val.restore_md5 = opt.md5sig;
+
+        let mut vec = libc::iovec {
+            iov_base: p as *mut libc::c_void,
+            iov_len: pos as usize,
+        };
+        let len = unsafe { libc::vmsplice(fds[1], &mut vec as *mut _, 1, libc::SPLICE_F_GIFT) };
+        if len < 0 {
+            uniperror("vmsplice");
+            break;
+        }
+        let len = unsafe { libc::splice(fds[0], ptr::null_mut(), val.fd, ptr::null_mut(), len as usize, 0) };
+        if len < 0 {
+            uniperror("splice");
+            break;
+        }
+        ret = len as isize;
+        break;
+    }
+
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    ret
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_fake(
+    _val: &mut eval,
+    _buffer: &[u8],
+    _pos: isize,
+    _opt: &DesyncParams,
+    _pkt: packet,
+) -> isize {
+    -1
 }
 
 fn send_bytes(fd: i32, buf: &[u8], flags: i32) -> isize {
@@ -351,12 +711,41 @@ fn tamp(
 
 // ---- API ----
 
-pub fn pre_desync(_sfd: i32, _dp: *mut DesyncParams) -> i32 {
-    // Linux drop_sack not ported here; keep as no-op for Windows-first.
+pub fn pre_desync(sfd: i32, dp: *mut DesyncParams) -> i32 {
+    if dp.is_null() {
+        return -1;
+    }
+    let dp = unsafe { &*dp };
+    if dp.drop_sack && drop_sack(sfd) != 0 {
+        return -1;
+    }
     0
 }
 
-pub fn post_desync(_sfd: i32, _dp: *mut DesyncParams) -> i32 {
+pub fn post_desync(sfd: i32, dp: *mut DesyncParams) -> i32 {
+    if dp.is_null() {
+        return -1;
+    }
+    let dp = unsafe { &*dp };
+    #[cfg(target_os = "linux")]
+    {
+        if dp.drop_sack {
+            let nop: i32 = 0;
+            let rc = unsafe {
+                libc::setsockopt(
+                    sfd,
+                    libc::SOL_SOCKET,
+                    libc::SO_DETACH_FILTER,
+                    &nop as *const _ as *const libc::c_void,
+                    mem::size_of_val(&nop) as libc::socklen_t,
+                )
+            };
+            if rc == -1 {
+                uniperror("setsockopt SO_DETACH_FILTER");
+                return -1;
+            }
+        }
+    }
     0
 }
 
@@ -499,6 +888,27 @@ pub fn desync(
                         dp.oob_char,
                     );
                 }
+                x if x == demode::DESYNC_FAKE as i32 => {
+                    let pkt = get_tcp_fake(&mut_view[..(n as usize)], &mut info, dp);
+                    if pkt.data.is_null() {
+                        return -1;
+                    }
+                    if pos != lp {
+                        let start = lp as usize;
+                        let len = (pos - lp) as usize;
+                        s = send_fake(
+                            val,
+                            &mut_view[start..start.saturating_add(len)],
+                            len as isize,
+                            dp,
+                            pkt,
+                        );
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    unsafe {
+                        libc::free(pkt.data as *mut libc::c_void);
+                    }
+                }
                 x if x == demode::DESYNC_DISORDER as i32 || x == demode::DESYNC_DISOOB as i32 => {
                     if ((part.r - r) % 2) == 0 {
                         if setttl(sfd, 1) < 0 {
@@ -567,10 +977,10 @@ pub fn desync(
             return (lp as isize) + s - offset;
         }
 
-        // wait_send / notsent detection (linux tcpi_notsent not ported here)
+        // wait_send / notsent detection
         let wait_send = unsafe { PARAMS.wait_send };
-        if wait_send && curr_part > part_skip {
-            log(LOG_S, "wait_send\n");
+        if sock_has_notsent(sfd) || (wait_send && curr_part > part_skip) {
+            log(LOG_S, "sock_has_notsent\n");
             let vidx = eval_index(pool, val);
             conev::set_timer(pool, vidx, unsafe { PARAMS.await_int as i64 });
             *wait = true;
