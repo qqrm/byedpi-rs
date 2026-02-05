@@ -12,10 +12,19 @@
 #![allow(non_camel_case_types)]
 
 use core::{cmp::Ordering, mem, ptr};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::slice;
 
 use crate::params::{
-    CMP_BITS, CMP_BYTES, CMP_HOST, MF_EXTRA, MF_STATIC, elem, elem_ex, elem_i, mphdr,
+    CMP_BITS, CMP_BYTES, CMP_HOST, MF_EXTRA, MF_STATIC, PARAMS, elem, elem_ex, elem_i, mphdr,
 };
+
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+#[cfg(not(windows))]
+use libc::{AF_INET, AF_INET6};
 
 fn bit_cmp(p: &elem, q: &elem) -> Ordering {
     let len = if q.len < p.len { q.len } else { p.len };
@@ -108,9 +117,7 @@ unsafe fn destroy_elem(hdr: *mut mphdr, e: *mut elem) {
     // free(e->data) unless MF_STATIC
     if ((*hdr).flags & MF_STATIC) == 0 {
         if !(*e).data.is_null() {
-            let _ = Box::from_raw((*e).data as *mut u8);
-            // NOTE: This only works correctly if callers allocate `data` via Box::into_raw on a u8.
-            // For now, most callers will allocate via our helpers later; until then you can set MF_STATIC.
+            libc_free((*e).data as *mut core::ffi::c_void);
         }
     }
 
@@ -118,7 +125,7 @@ unsafe fn destroy_elem(hdr: *mut mphdr, e: *mut elem) {
     if ((*hdr).flags & MF_EXTRA) != 0 {
         let ex = e as *mut elem_ex;
         if !(*ex).extra.is_null() {
-            let _ = Box::from_raw((*ex).extra as *mut u8);
+            libc_free((*ex).extra as *mut core::ffi::c_void);
         }
     }
 
@@ -299,11 +306,274 @@ pub fn mem_destroy(hdr: *mut mphdr) {
 }
 
 // void dump_cache(struct mphdr *hdr, FILE *out);
-pub fn dump_cache(_hdr: *mut mphdr, _out: *mut core::ffi::c_void) {
-    // TODO: port once we wire cache format + inet_ntop/FILE* equivalents for Windows.
+pub fn dump_cache(hdr: *mut mphdr, out: &mut dyn Write) -> io::Result<()> {
+    if hdr.is_null() {
+        return Ok(());
+    }
+    let now = time_now();
+
+    let (cache_ttl_n, cache_ttl_ptr) = unsafe { (PARAMS.cache_ttl_n, PARAMS.cache_ttl) };
+    let cache_ttl = unsafe {
+        if cache_ttl_ptr.is_null() || cache_ttl_n <= 0 {
+            None
+        } else {
+            Some(slice::from_raw_parts(
+                cache_ttl_ptr,
+                cache_ttl_n as usize,
+            ))
+        }
+    };
+
+    unsafe {
+        for &p in (*hdr).items.iter() {
+            if p.is_null() {
+                continue;
+            }
+            let item = &*(p as *mut elem_i);
+            if item.main.data.is_null() {
+                continue;
+            }
+
+            if item.main.len < 4 {
+                continue;
+            }
+
+            let data = slice::from_raw_parts(item.main.data as *const u8, item.main.len as usize);
+            if data.len() < 4 {
+                continue;
+            }
+
+            let port = u16::from_be_bytes([data[0], data[1]]);
+            let family = u16::from_ne_bytes([data[2], data[3]]);
+            let addr_bytes = &data[4..];
+
+            let addr = if family == AF_INET as u16 {
+                if addr_bytes.len() < 4 {
+                    continue;
+                }
+                IpAddr::V4(Ipv4Addr::from([
+                    addr_bytes[0],
+                    addr_bytes[1],
+                    addr_bytes[2],
+                    addr_bytes[3],
+                ]))
+            } else if family == AF_INET6 as u16 {
+                if addr_bytes.len() < 16 {
+                    continue;
+                }
+                IpAddr::V6(Ipv6Addr::from([
+                    addr_bytes[0],
+                    addr_bytes[1],
+                    addr_bytes[2],
+                    addr_bytes[3],
+                    addr_bytes[4],
+                    addr_bytes[5],
+                    addr_bytes[6],
+                    addr_bytes[7],
+                    addr_bytes[8],
+                    addr_bytes[9],
+                    addr_bytes[10],
+                    addr_bytes[11],
+                    addr_bytes[12],
+                    addr_bytes[13],
+                    addr_bytes[14],
+                    addr_bytes[15],
+                ]))
+            } else {
+                continue;
+            };
+
+            if let Some(ttl) = cache_ttl {
+                if item.time_inc <= 0 {
+                    continue;
+                }
+                let idx = (item.time_inc - 1) as usize;
+                if idx >= ttl.len() {
+                    continue;
+                }
+                let ttl = ttl[idx] as i64;
+                if now > item.time + ttl {
+                    continue;
+                }
+            }
+
+            write!(
+                out,
+                "0 {} {} {} {} {} ",
+                addr, port, item.dp_mask, item.time, item.time_inc
+            )?;
+
+            if item.extra_len > 0 && !item.extra.is_null() {
+                let extra =
+                    slice::from_raw_parts(item.extra as *const u8, item.extra_len as usize);
+                out.write_all(extra)?;
+            }
+            out.write_all(b"\n")?;
+        }
+    }
+    out.flush()
 }
 
 // void load_cache(struct mphdr *hdr, FILE *in);
-pub fn load_cache(_hdr: *mut mphdr, _in: *mut core::ffi::c_void) {
-    // TODO: same as above.
+pub fn load_cache(hdr: *mut mphdr, input: &mut dyn Read) -> io::Result<()> {
+    if hdr.is_null() {
+        return Ok(());
+    }
+    let mut buf = String::new();
+    input.read_to_string(&mut buf)?;
+
+    let cache_ttl_n = unsafe { PARAMS.cache_ttl_n };
+
+    for line in buf.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(tag) = parts.next() else {
+            continue;
+        };
+        if tag != "0" {
+            continue;
+        }
+
+        let Some(addr_str) = parts.next() else {
+            continue;
+        };
+        let Some(port_str) = parts.next() else {
+            continue;
+        };
+        let Some(mask_str) = parts.next() else {
+            continue;
+        };
+        let Some(time_str) = parts.next() else {
+            continue;
+        };
+        let Some(inc_str) = parts.next() else {
+            continue;
+        };
+        let host = parts.next().unwrap_or("");
+
+        let port: u16 = match port_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let mask: u64 = match mask_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let cache_time: i64 = match time_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let cache_inc: i32 = match inc_str.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if cache_inc > cache_ttl_n {
+            continue;
+        }
+
+        let ip = match addr_str.parse::<IpAddr>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let (family, addr_bytes) = match ip {
+            IpAddr::V4(v4) => (AF_INET as u16, v4.octets().to_vec()),
+            IpAddr::V6(v6) => (AF_INET6 as u16, v6.octets().to_vec()),
+        };
+
+        let mut key = Vec::with_capacity(4 + addr_bytes.len());
+        key.extend_from_slice(&port.to_be_bytes());
+        key.extend_from_slice(&family.to_ne_bytes());
+        key.extend_from_slice(&addr_bytes);
+
+        let key_size = key.len();
+        let data = unsafe { libc_calloc(1, key_size) as *mut u8 };
+        if data.is_null() {
+            return Ok(());
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(key.as_ptr(), data, key_size);
+        }
+
+        let e = unsafe {
+            mem_add(
+                hdr,
+                data as *mut i8,
+                key_size as i32,
+                mem::size_of::<elem_i>(),
+            ) as *mut elem_i
+        };
+        if e.is_null() {
+            unsafe {
+                libc_free(data as *mut core::ffi::c_void);
+            }
+            return Ok(());
+        }
+
+        unsafe {
+            (*e).detect = -1;
+            (*e).dp_mask = mask;
+            (*e).time = cache_time;
+            (*e).time_inc = cache_inc;
+            (*e).extra_len = host.len() as u32;
+
+            if (*e).extra_len > 0 {
+                let extra = libc_malloc((*e).extra_len as usize + 1) as *mut u8;
+                if !extra.is_null() {
+                    ptr::copy_nonoverlapping(host.as_ptr(), extra, (*e).extra_len as usize);
+                    *extra.add((*e).extra_len as usize) = 0;
+                    (*e).extra = extra as *mut i8;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn time_now() -> i64 {
+    #[cfg(windows)]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        libc::time(ptr::null_mut()) as i64
+    }
+}
+
+unsafe fn libc_calloc(n: usize, sz: usize) -> *mut core::ffi::c_void {
+    #[cfg(not(windows))]
+    {
+        libc::calloc(n, sz)
+    }
+    #[cfg(windows)]
+    {
+        libc::calloc(n, sz)
+    }
+}
+
+unsafe fn libc_malloc(sz: usize) -> *mut core::ffi::c_void {
+    #[cfg(not(windows))]
+    {
+        libc::malloc(sz)
+    }
+    #[cfg(windows)]
+    {
+        libc::malloc(sz)
+    }
+}
+
+unsafe fn libc_free(p: *mut core::ffi::c_void) {
+    #[cfg(not(windows))]
+    {
+        libc::free(p)
+    }
+    #[cfg(windows)]
+    {
+        libc::free(p)
+    }
 }

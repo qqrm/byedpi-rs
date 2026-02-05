@@ -2,13 +2,19 @@
 #![allow(clippy::needless_return)]
 #![allow(clippy::match_single_binding)]
 
+mod mpool;
+mod params;
+
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use socket2::{Domain, Protocol, Socket, Type};
+
+use crate::mpool;
+use crate::params::{CMP_BYTES, MF_EXTRA, PARAMS};
 
 const VERSION: &str = "17.3";
 
@@ -571,16 +577,6 @@ fn parse_offset(part: &mut Part, s: &str) -> Result<(), ()> {
 fn run(_listen: &SocketAddr) -> i32 {
     // TODO: port proxy main loop
     0
-}
-
-fn load_cache(_bytes_mempool_like: &mut Vec<u8>, _r: &mut dyn Read) -> io::Result<()> {
-    // TODO
-    Ok(())
-}
-
-fn dump_cache(_bytes_mempool_like: &Vec<u8>, _w: &mut dyn io::Write) -> io::Result<()> {
-    // TODO
-    Ok(())
 }
 
 // ---- argv parsing (faithful to main.c control flow, including -A/-B rewind) ----
@@ -1238,12 +1234,19 @@ fn real_main(argv: Vec<OsString>) -> Result<i32, String> {
     }
 
     // cache load
-    // C uses mem_pool; here we use Vec<u8> placeholder until you port mem_pool/cache format.
-    let mut cache_blob: Vec<u8> = Vec::new();
+    let mempool = mpool::mem_pool(MF_EXTRA, CMP_BYTES);
+    if mempool.is_null() {
+        return Err("mem_pool failed".into());
+    }
+    unsafe {
+        PARAMS.cache_ttl_n = params.cache_ttl.len() as i32;
+        PARAMS.cache_ttl = params.cache_ttl.as_mut_ptr();
+        PARAMS.mempool = mempool;
+    }
     if let Some(cf) = &params.cache_file {
         if cf != "-" {
             if let Ok(mut f) = fs::File::open(cf) {
-                let _ = load_cache(&mut cache_blob, &mut f);
+                let _ = mpool::load_cache(mempool, &mut f);
             }
         }
     }
@@ -1263,12 +1266,14 @@ fn real_main(argv: Vec<OsString>) -> Result<i32, String> {
     if let Some(cf) = &params.cache_file {
         if cf == "-" {
             let mut w = io::stdout();
-            let _ = dump_cache(&cache_blob, &mut w);
+            let _ = mpool::dump_cache(mempool, &mut w);
         } else {
             let mut f = fs::File::create(cf).map_err(|e| format!("fopen/create failed: {e}"))?;
-            let _ = dump_cache(&cache_blob, &mut f);
+            let _ = mpool::dump_cache(mempool, &mut f);
         }
     }
+
+    mpool::mem_destroy(mempool);
 
     Ok(status)
 }
