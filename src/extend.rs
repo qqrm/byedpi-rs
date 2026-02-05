@@ -19,11 +19,15 @@
 
 use core::{mem, ptr};
 
-use crate::conev::{buffer as CBuffer, eval, evcb_t, poolhd};
+use crate::conev::{self, buffer as CBuffer, eval, evcb_t, poolhd};
 use crate::desync;
 use crate::error::{Errno, LOG_E, LOG_L, LOG_S, get_e, log, uniperror};
 use crate::mpool;
-use crate::params::{DesyncParams, PARAMS, SockaddrU, elem_i, mphdr};
+use crate::packets;
+use crate::params::{
+    AUTO_POST, AUTO_RECONN, AUTO_SORT, DETECT_TORST, DesyncParams, PARAMS, SockaddrU, elem_i,
+    mphdr,
+};
 use crate::proxy;
 
 // These are expected to be defined in your conev/proxy ports.
@@ -333,13 +337,9 @@ pub fn connect_hook(pool: &mut poolhd, val: &mut eval, dst: &SockaddrU, next: ev
 
         let mut cached = cache_get(dst);
 
-        // Save hostname from cached->extra (stub: packets not ported)
-        let mut host: *mut i8 = ptr::null_mut();
-        let mut host_len: i32 = 0;
-
-        if !cached.is_null() && !(*cached).extra.is_null() {
-            host = (*cached).extra;
-            host_len = (*cached).extra_len as i32;
+        if val.dp_mask == 0 && !cached.is_null() {
+            val.dp_mask = (*cached).dp_mask;
+            val.detect = (*cached).detect;
         }
 
         // choose dp
@@ -359,8 +359,10 @@ pub fn connect_hook(pool: &mut poolhd, val: &mut eval, dst: &SockaddrU, next: ev
                 continue;
             }
 
-            // check_l34(dp, SOCK_STREAM, dst) is static helper; keep permissive until packets.c is ported.
-            if check_l34(cand, sock_stream_compat(), dst) {
+            if (val.dp_mask & (*cand).bit) == 0
+                && ((*cand).detect == 0 || (val.detect & (*cand).detect) != 0)
+                && check_l34(cand, sock_stream_compat(), dst)
+            {
                 dp = cand;
                 break;
             }
@@ -435,17 +437,10 @@ pub fn udp_hook(val: &mut eval, buffer: &mut [u8], n: isize, dst: &SockaddrU) ->
 }
 
 pub fn on_torst(pool: &mut poolhd, val: &mut eval) -> i32 {
-    // C:
-    // - if auto_reconn => attempt reconnect with next dp profile
-    // - else close pair
-    //
-    // Minimal behavior for now: mark dp as failed, try reconnect if possible.
-    unsafe {
-        if !val.dp.is_null() {
-            val.dp_mask |= (*val.dp).bit;
-        }
-        // AUTO_RECONN/AUTO_SORT logic will be reintroduced after packets and full proxy loop are ported.
+    if on_trigger(DETECT_TORST, pool, val, true) == 0 {
+        return 0;
     }
+    set_linger(pool, val);
     -1
 }
 
@@ -453,23 +448,342 @@ pub fn on_torst(pool: &mut poolhd, val: &mut eval) -> i32 {
 // internal checks (stubs until packets module is ported)
 // ---------------------------------
 
+fn check_host(hosts: *mut mphdr, buffer: *const i8, n: isize) -> bool {
+    if hosts.is_null() || buffer.is_null() || n <= 0 {
+        return false;
+    }
+    unsafe {
+        let mut host: *mut i8 = ptr::null_mut();
+        let mut len = packets::parse_tls(buffer, n as usize, &mut host);
+        if len == 0 {
+            len = packets::parse_http(buffer, n as usize, &mut host, ptr::null_mut());
+        }
+        if len <= 0 || host.is_null() {
+            return false;
+        }
+        let v = mpool::mem_get(hosts, host, len);
+        !v.is_null() && (*v).len <= len
+    }
+}
+
+fn check_ip(ipset: *mut mphdr, dst: &SockaddrU) -> bool {
+    if ipset.is_null() {
+        return false;
+    }
+    unsafe {
+        let (len, data): (usize, *const i8) = if (dst.sa.sa_family as i32) == (AF_INET as i32) {
+            (
+                mem::size_of::<in_addr_compat>(),
+                &dst.in_.sin_addr as *const _ as *const i8,
+            )
+        } else {
+            (
+                mem::size_of::<in6_addr_compat>(),
+                &dst.in6.sin6_addr as *const _ as *const i8,
+            )
+        };
+        !mpool::mem_get(ipset, data, (len * 8) as i32).is_null()
+    }
+}
+
+fn check_proto_tcp(proto: i32, buffer: *const i8, n: isize) -> bool {
+    if (proto & !(packets::IS_IPV4)) == 0 {
+        return true;
+    }
+    if (proto & packets::IS_HTTP) != 0 && packets::is_http(buffer, n as usize) {
+        return true;
+    }
+    (proto & packets::IS_HTTPS) != 0 && packets::is_tls_chello(buffer, n as usize)
+}
+
 fn check_l34(dp: *mut DesyncParams, st: i32, dst: &SockaddrU) -> bool {
-    // In C this checks:
-    // - protocol (tcp/udp)
-    // - port filters dp.pf
-    // - hosts/ipset matching (via packets parsing + mempool)
-    // - detect flags
-    //
-    // Until packets.{c,h} is ported, keep permissive: only port/proto filters if present.
     unsafe {
         if dp.is_null() {
             return false;
         }
-        if (*dp).proto != 0 {
-            // if dp->proto specified, match st
-            // (exact mapping is in C; we keep it permissive here)
+        if ((*dp).proto & packets::IS_UDP) != 0 && st != sock_dgram_compat() {
+            return false;
+        }
+        if ((*dp).proto & packets::IS_TCP) != 0 && st != sock_stream_compat() {
+            return false;
+        }
+        if ((*dp).proto & packets::IS_IPV4) != 0 {
+            let pat: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+            if (dst.sa.sa_family as i32) != (AF_INET as i32)
+                && core::slice::from_raw_parts(
+                    &dst.in6.sin6_addr as *const _ as *const u8,
+                    pat.len(),
+                ) != pat
+            {
+                return false;
+            }
+        }
+        if (*dp).pf[0] != 0 && (dst.in_.sin_port < (*dp).pf[0] || dst.in_.sin_port > (*dp).pf[1])
+        {
+            return false;
+        }
+        if !(*dp).ipset.is_null() && !check_ip((*dp).ipset, dst) {
+            return false;
         }
         true
+    }
+}
+
+fn save_hostname(client: &mut eval, buffer: *const i8, n: isize) {
+    if client.host.is_some() || buffer.is_null() || n <= 0 {
+        return;
+    }
+    unsafe {
+        let mut host: *mut i8 = ptr::null_mut();
+        let mut len = packets::parse_tls(buffer, n as usize, &mut host);
+        if len == 0 {
+            len = packets::parse_http(buffer, n as usize, &mut host, ptr::null_mut());
+        }
+        if len <= 0 || host.is_null() {
+            return;
+        }
+        let slice = core::slice::from_raw_parts(host as *const u8, len as usize);
+        client.host = Some(slice.to_vec());
+        client.host_len = len;
+    }
+}
+
+fn check_round(nr: &[i32; 2], r: u32) -> bool {
+    let r = r as i32;
+    (nr[1] == 0 && r <= 1) || (r >= nr[0] && r <= nr[1])
+}
+
+fn swop_groups(dpc: *mut DesyncParams, dpn: *mut DesyncParams) {
+    unsafe {
+        log(LOG_S, &format!("swop: {} <-> {}\n", (*dpc).id, (*dpn).id));
+
+        let dpc_cp = *dpc;
+        (*dpc).next = (*dpn).next;
+        (*dpc).prev = (*dpn).prev;
+
+        (*dpn).prev = dpc_cp.prev;
+        (*dpn).next = dpc_cp.next;
+
+        if !(*dpn).prev.is_null() {
+            (*(*dpn).prev).next = dpn;
+        }
+        if !(*dpc).next.is_null() {
+            (*(*dpc).next).prev = dpc;
+        }
+
+        if dpc_cp.next != dpn {
+            (*(*dpn).next).prev = dpn;
+            (*(*dpc).prev).next = dpc;
+        } else {
+            (*dpc).prev = dpn;
+            (*dpn).next = dpc;
+        }
+        (*dpc).detect = (*dpn).detect;
+        (*dpn).detect = dpc_cp.detect;
+
+        if PARAMS.dp == dpc {
+            PARAMS.dp = dpn;
+        }
+    }
+}
+
+fn reconnect(pool: &mut poolhd, val: &mut eval) -> i32 {
+    debug_assert_eq!(val.flag, FLAG_CONN);
+
+    let client_idx = match val.pair {
+        Some(idx) => idx,
+        None => return -1,
+    };
+
+    let addr = val.addr;
+    let has_sq = pool.items[client_idx as usize].sq_buff.is_some();
+    let next = if has_sq { on_tunnel } else { on_connect };
+
+    let client_ptr = unsafe { pool.items.as_mut_ptr().add(client_idx as usize) };
+    if unsafe { connect_hook(pool, &mut *client_ptr, &addr, next) } != 0 {
+        return -1;
+    }
+
+    val.pair = None;
+    conev::del_event(pool, val.index);
+
+    let client = unsafe { pool.items.get_unchecked_mut(client_idx as usize) };
+    client.cb = Some(on_tunnel);
+
+    if let Some(sq_buff) = client.sq_buff.as_ref() {
+        if client.buff.is_none() {
+            client.buff = conev::buff_pop(pool, sq_buff.size);
+        }
+        if let Some(buff) = client.buff.as_mut() {
+            buff.lock = sq_buff.lock;
+            let len = buff.lock.max(0) as usize;
+            if len <= buff.data.len() && len <= sq_buff.data.len() {
+                buff.data[..len].copy_from_slice(&sq_buff.data[..len]);
+            }
+            buff.offset = 0;
+        }
+    }
+
+    client.round_sent = 0;
+    client.part_sent = 0;
+    0
+}
+
+fn on_trigger(type_: i32, pool: &mut poolhd, val: &mut eval, client_alive: bool) -> i32 {
+    let client_idx = match val.pair {
+        Some(idx) => idx,
+        None => return -1,
+    };
+
+    let (before_req, can_reconn) = {
+        let client = unsafe { pool.items.get_unchecked(client_idx as usize) };
+        let before_req = client.recv_count == 0 && val.recv_count == 0;
+        let can_reconn = (client.sq_buff.is_some() || before_req)
+            && (unsafe { PARAMS.auto_level } & AUTO_RECONN) != 0
+            && client_alive;
+        (before_req, can_reconn)
+    };
+
+    if !can_reconn && (unsafe { PARAMS.auto_level } & AUTO_POST) == 0 {
+        return -1;
+    }
+
+    let client = unsafe { pool.items.get_unchecked_mut(client_idx as usize) };
+    let (mut host_ptr, host_len) = match client.host.take() {
+        Some(host) => unsafe {
+            let host_len = host.len() as i32;
+            let data = libc_calloc(1, host.len()) as *mut u8;
+            if !data.is_null() {
+                ptr::copy_nonoverlapping(host.as_ptr(), data, host.len());
+                (data as *mut i8, host_len)
+            } else {
+                client.host = Some(host);
+                (ptr::null_mut(), 0)
+            }
+        },
+        None => (ptr::null_mut(), 0),
+    };
+
+    let cache = cache_add(&val.addr, &mut host_ptr, host_len);
+    if !host_ptr.is_null() {
+        unsafe { libc_free(host_ptr as *mut core::ffi::c_void) };
+    }
+    if cache.is_null() {
+        return -1;
+    }
+
+    if client.dp.is_null() {
+        return -1;
+    }
+    unsafe {
+        (*client.dp).fail_count += 1;
+        client.dp_mask |= (*client.dp).bit;
+        client.detect = type_;
+    }
+
+    let mut unchecked = client.dp_mask;
+    let mut dp = unsafe { PARAMS.dp };
+    let mut next: *mut DesyncParams = ptr::null_mut();
+    unsafe {
+        while !dp.is_null() {
+            if unchecked == 0 && (*dp).detect == 0 {
+                break;
+            }
+            if ((*dp).bit & client.dp_mask) == 0
+                && ((*dp).detect == 0 || ((*dp).detect & type_) != 0)
+            {
+                next = dp;
+                break;
+            }
+            unchecked &= !(*dp).bit;
+            client.dp_mask |= (*dp).bit;
+            dp = (*dp).next;
+        }
+    }
+
+    unsafe {
+        if (PARAMS.auto_level & AUTO_SORT) != 0 && ((*client.dp).bit & (*cache).dp_mask) == 0
+        {
+            if !next.is_null()
+                && (*client.dp).pri > (*next).pri
+                && ((*client.dp).bit & unchecked) == 0
+            {
+                swop_groups(client.dp, next);
+            }
+            (*client.dp).pri += 1;
+        }
+    }
+
+    if next.is_null() {
+        if let Some(addr) = crate::error::addr_to_str(&val.addr) {
+            log(LOG_S, &format!("unreach ip: {addr}\n"));
+        }
+        unsafe {
+            (*cache).dp_mask = 0;
+            (*cache).detect = 0;
+        }
+        return -1;
+    }
+
+    if let Some(addr) = crate::error::addr_to_str(&val.addr) {
+        unsafe {
+            log(LOG_S, &format!("save: ip={addr}, id={}\n", (*next).id));
+        }
+    }
+
+    unsafe {
+        (*cache).dp_mask |= client.dp_mask;
+        (*cache).detect = client.detect;
+    }
+
+    if can_reconn {
+        return reconnect(pool, val);
+    }
+    -1
+}
+
+fn set_linger(pool: &mut poolhd, val: &mut eval) {
+    let pair_idx = match val.pair {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    #[cfg(windows)]
+    unsafe {
+        let linger = LINGER {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let fd = pool.items.get(pair_idx as usize).map(|v| v.fd).unwrap_or(-1);
+        if fd < 0 {
+            return;
+        }
+        let _ = setsockopt(
+            fd as usize,
+            SOL_SOCKET as i32,
+            SO_LINGER as i32,
+            (&linger as *const LINGER) as *const u8,
+            mem::size_of_val(&linger) as i32,
+        );
+    }
+
+    #[cfg(not(windows))]
+    unsafe {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let fd = pool.items.get(pair_idx as usize).map(|v| v.fd).unwrap_or(-1);
+        if fd < 0 {
+            return;
+        }
+        let _ = setsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_LINGER,
+            (&linger as *const libc::linger).cast::<core::ffi::c_void>(),
+            mem::size_of_val(&linger) as libc::socklen_t,
+        );
     }
 }
 
@@ -510,6 +824,17 @@ fn sock_stream_compat() -> i32 {
     #[cfg(not(windows))]
     {
         libc::SOCK_STREAM
+    }
+}
+
+fn sock_dgram_compat() -> i32 {
+    #[cfg(windows)]
+    {
+        SOCK_DGRAM as i32
+    }
+    #[cfg(not(windows))]
+    {
+        libc::SOCK_DGRAM
     }
 }
 
