@@ -13,7 +13,7 @@ use crate::error::{LOG_E, LOG_S, get_e_raw, log, uniperror};
 use crate::extend::udp_hook;
 use crate::params::{PARAMS, SockaddrU};
 use crate::proxy::{map_fix, nb_socket, on_ignore, remote_sock, s5_get_addr};
-use crate::proxy::socks5::{s5_set_addr, S_SIZE_I6};
+use crate::proxy::socks5::{s5_set_addr, S_SIZE_I4, S_SIZE_I6};
 
 #[cfg(windows)]
 use windows_sys::Win32::Networking::WinSock::*;
@@ -179,7 +179,7 @@ pub fn on_udp_tunnel(pool: &mut poolhd, val: &mut eval, _et: i32) -> i32 {
     };
     let mut data_offset = 0usize;
     if val.flag != conev::FLAG_CONN {
-        data_offset = 3 + S_SIZE_I6;
+        data_offset = S_SIZE_I6;
     }
     let data_len = buff.size - data_offset;
     let mut pair_idx = val.pair;
@@ -293,19 +293,23 @@ pub fn on_udp_tunnel(pool: &mut poolhd, val: &mut eval, _et: i32) -> i32 {
             )
         } else {
             map_fix(&mut addr, false);
-            let header_len = 3 + S_SIZE_I6;
-            let header_start = data_offset - header_len;
-            buff.data[header_start..header_start + 3].fill(0);
-            let offs = s5_set_addr(
-                &mut buff.data[header_start + 3..header_start + header_len],
+            buff.data[..S_SIZE_I6].fill(0);
+            let offs = match addr.sa.sa_family as i32 {
+                x if x == AF_INET as i32 => S_SIZE_I4,
+                x if x == AF_INET6 as i32 => S_SIZE_I6,
+                _ => return -1,
+            };
+            let header_start = S_SIZE_I6 - offs;
+            let wrote = s5_set_addr(
+                &mut buff.data[header_start..header_start + offs],
                 &addr,
                 false,
             );
-            if offs < 0 || offs as usize > S_SIZE_I6 {
+            if wrote < 0 || wrote as usize != offs {
                 return -1;
             }
-            let send_start = data_offset - (3 + offs as usize);
-            let total = 3 + offs as usize + n;
+            let send_start = header_start;
+            let total = offs + n;
             unsafe {
                 #[cfg(windows)]
                 {
