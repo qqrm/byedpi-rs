@@ -19,6 +19,7 @@ use core::{cmp::min, mem, ptr};
 
 use crate::conev::{self, buffer as CBuffer, eval, poolhd};
 use crate::error::{Errno, LOG_E, LOG_L, LOG_S, get_e, log, uniperror};
+use crate::packets;
 use crate::params::{
     DesyncParams, OFFSET_END, OFFSET_HOST, OFFSET_MID, OFFSET_RAND, OFFSET_SNI, OFFSET_START,
     PARAMS, demode, part,
@@ -32,55 +33,12 @@ use libc::*;
 
 const ERR_WAIT: isize = -12;
 
-// ---- packets glue (will be fully ported later) ----
-mod packets_glue {
-    pub const IS_HTTP: u8 = 1;
-    pub const IS_HTTPS: u8 = 2;
-
-    #[inline]
-    pub fn is_tls_chello(_buf: &[u8]) -> bool {
-        false
-    }
-    #[inline]
-    pub fn is_http(_buf: &[u8]) -> bool {
-        false
-    }
-
-    // Returns host_len and host_pos (offset in buffer). 0 means "not found".
-    #[inline]
-    pub fn parse_tls(_buf: &[u8]) -> Option<(usize, usize)> {
-        None
-    }
-    #[inline]
-    pub fn parse_http(_buf: &[u8]) -> Option<(usize, usize)> {
-        None
-    }
-
-    #[inline]
-    pub fn mod_http(_buf: &mut [u8], _mode: i32) -> Result<(), ()> {
-        Err(())
-    }
-
-    #[inline]
-    pub fn part_tls(_buf: &mut [u8], _pos: usize) -> bool {
-        false
-    }
-
-    #[inline]
-    pub fn randomize_tls(_buf: &mut [u8]) {}
-
-    #[inline]
-    pub fn change_tls_sni(_sni: *const i8, _buf: &mut [u8], _limit: usize) -> i32 {
-        -1
-    }
-}
-
 // ---- protocol info ----
 
 #[derive(Clone, Copy, Default)]
 pub struct ProtoInfo {
     pub init: bool,
-    pub type_: u8,
+    pub type_: i32,
     pub host_len: i32,
     pub host_pos: i32,
 }
@@ -90,21 +48,32 @@ fn init_proto_info(buffer: &[u8], info: &mut ProtoInfo) {
         return;
     }
 
-    if let Some((hlen, hpos)) = packets_glue::parse_tls(buffer) {
-        info.type_ = packets_glue::IS_HTTPS;
-        info.host_len = hlen as i32;
-        info.host_pos = hpos as i32;
-        info.init = true;
-        return;
+    let mut host: *mut i8 = ptr::null_mut();
+    let hlen = packets::parse_tls(
+        buffer.as_ptr() as *const i8,
+        buffer.len(),
+        &mut host,
+    );
+    if hlen != 0 {
+        info.type_ = packets::IS_HTTPS;
+        info.host_len = hlen;
+    } else {
+        let hlen = packets::parse_http(
+            buffer.as_ptr() as *const i8,
+            buffer.len(),
+            &mut host,
+            ptr::null_mut(),
+        );
+        if hlen != 0 {
+            info.type_ = packets::IS_HTTP;
+            info.host_len = hlen;
+        }
     }
-    if let Some((hlen, hpos)) = packets_glue::parse_http(buffer) {
-        info.type_ = packets_glue::IS_HTTP;
-        info.host_len = hlen as i32;
-        info.host_pos = hpos as i32;
-        info.init = true;
-        return;
-    }
-
+    info.host_pos = if host.is_null() {
+        0
+    } else {
+        unsafe { (host as *const u8).offset_from(buffer.as_ptr()) as i32 }
+    };
     info.init = true;
 }
 
@@ -116,7 +85,7 @@ fn gen_offset(mut pos: i64, flag: i32, buffer: &[u8], lp: i64, info: &mut ProtoI
         init_proto_info(buffer, info);
 
         if info.host_pos == 0
-            || (((flag & OFFSET_SNI) != 0) && info.type_ != packets_glue::IS_HTTPS)
+            || (((flag & OFFSET_SNI) != 0) && info.type_ != packets::IS_HTTPS)
         {
             return -1;
         }
@@ -274,27 +243,109 @@ fn send_oob(fd: i32, buffer: &mut [u8], n: isize, pos: i64, c: [i8; 2]) -> isize
     len
 }
 
-fn tamp(buffer: &mut [u8], n: &mut isize, dp: &DesyncParams, info: &mut ProtoInfo) {
+fn tamp(
+    buffer: &mut [u8],
+    bfsize: usize,
+    n: &mut isize,
+    dp: &DesyncParams,
+    info: &mut ProtoInfo,
+) {
     // HTTP modifications
-    if dp.mod_http != 0 && packets_glue::is_http(&buffer[..(*n as usize)]) {
+    if dp.mod_http != 0
+        && packets::is_http(buffer.as_ptr() as *const i8, *n as usize)
+    {
         log(LOG_S, &format!("modify HTTP: n={}\n", *n));
-        if packets_glue::mod_http(&mut buffer[..(*n as usize)], dp.mod_http).is_err() {
+        if packets::mod_http(
+            buffer.as_mut_ptr() as *mut i8,
+            *n as usize,
+            dp.mod_http,
+        ) != 0
+        {
             log(LOG_E, "mod http error\n");
         }
     }
 
     // TLS minor version
-    if dp.tlsminor_set && packets_glue::is_tls_chello(&buffer[..(*n as usize)]) {
+    if dp.tlsminor_set
+        && packets::is_tls_chello(buffer.as_ptr() as *const i8, *n as usize)
+    {
         if *n >= 3 {
             buffer[2] = dp.tlsminor;
         }
     }
 
-    // TLS record splitting (simplified placeholder)
-    if dp.tlsrec_n != 0 && packets_glue::is_tls_chello(&buffer[..(*n as usize)]) {
-        // Full part_tls port lands with packets.c/h.
-        let _ = info;
-        let _ = dp;
+    // TLS record splitting
+    if dp.tlsrec_n != 0
+        && packets::is_tls_chello(buffer.as_ptr() as *const i8, *n as usize)
+    {
+        let mut lp: i64 = 0;
+        let mut part = part {
+            m: 0,
+            flag: 0,
+            pos: 0,
+            r: 0,
+            s: 0,
+        };
+        let mut i = 0;
+        let mut r = 0;
+        let mut rc = 0;
+
+        while r > 0 || i < dp.tlsrec_n {
+            if r <= 0 {
+                unsafe {
+                    let parts = core::slice::from_raw_parts(dp.tlsrec, dp.tlsrec_n as usize);
+                    part_copy(&mut part, &parts[i as usize]);
+                }
+                r = part.r;
+                i += 1;
+            }
+
+            let mut pos = (rc as i64) * 5;
+            let remaining = (*n as i64).saturating_sub(pos);
+            let slice_len = remaining.max(0) as usize;
+            pos += gen_offset(
+                part.pos as i64,
+                part.flag,
+                &buffer[..min(slice_len, buffer.len())],
+                lp,
+                info,
+            );
+            if part.pos < 0 || part.flag != 0 {
+                pos -= 5;
+            }
+            pos += (part.s as i64) * ((part.r - r) as i64);
+
+            if pos < lp {
+                log(LOG_E, &format!("tlsrec cancel: {} < {}\n", pos, lp));
+                break;
+            }
+
+            let lp_usize = lp.max(0) as usize;
+            if lp_usize >= bfsize {
+                log(LOG_E, &format!("tlsrec error: pos={}, n={}\n", pos, *n));
+                break;
+            }
+            let bsize = min(bfsize, buffer.len()).saturating_sub(lp_usize);
+            let n_rem = *n - lp as isize;
+            let pos_rel = pos - lp;
+            if packets::part_tls(
+                buffer[lp_usize..].as_mut_ptr() as *mut i8,
+                bsize,
+                n_rem,
+                pos_rel,
+            ) == 0
+            {
+                log(LOG_E, &format!("tlsrec error: pos={}, n={}\n", pos, *n));
+                break;
+            }
+
+            log(LOG_S, &format!("tlsrec: pos={}, n={}\n", pos, *n));
+            *n += 5;
+            lp = pos + 5;
+
+            rc += 1;
+            r -= 1;
+        }
     }
 }
 
@@ -378,7 +429,7 @@ pub fn desync(
     }
 
     if skip == 0 {
-        tamp(mut_view, &mut n, &dp, &mut info);
+        tamp(mut_view, bfsize, &mut n, &dp, &mut info);
     }
 
     let mut lp = offset as i64;
