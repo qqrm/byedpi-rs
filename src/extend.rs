@@ -17,7 +17,7 @@
 #![allow(non_camel_case_types)]
 #![allow(unused_variables)]
 
-use core::{mem, ptr};
+use core::{ffi::CStr, mem, ptr};
 
 use crate::conev::{self, buffer as CBuffer, eval, evcb_t, poolhd};
 use crate::desync;
@@ -787,14 +787,102 @@ fn set_linger(pool: &mut poolhd, val: &mut eval) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn protect(conn_fd: i32, path: *const i8) -> i32 {
-    // Linux-only in C; keep as no-op unless you port unix socket “protect” later.
-    let _ = (conn_fd, path);
-    0
+    unsafe {
+        if path.is_null() {
+            return 0;
+        }
+
+        let mut sa: libc::sockaddr_un = mem::zeroed();
+        sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_cstr = CStr::from_ptr(path);
+        let path_bytes = path_cstr.to_bytes_with_nul();
+        let max_len = sa.sun_path.len();
+        let copy_len = path_bytes.len().min(max_len);
+        ptr::copy_nonoverlapping(path_bytes.as_ptr(), sa.sun_path.as_mut_ptr() as *mut u8, copy_len);
+
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            uniperror("socket");
+            return -1;
+        }
+
+        let tv = libc::timeval {
+            tv_sec: 1,
+            tv_usec: 0,
+        };
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&tv as *const libc::timeval).cast::<core::ffi::c_void>(),
+            mem::size_of_val(&tv) as libc::socklen_t,
+        );
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            (&tv as *const libc::timeval).cast::<core::ffi::c_void>(),
+            mem::size_of_val(&tv) as libc::socklen_t,
+        );
+
+        let err = libc::connect(
+            fd,
+            (&sa as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+            mem::size_of_val(&sa) as libc::socklen_t,
+        );
+        if err != 0 {
+            uniperror("connect");
+            let _ = libc::close(fd);
+            return -1;
+        }
+
+        let cmsg_space = libc::CMSG_SPACE(mem::size_of::<i32>() as u32) as usize;
+        let mut buf = vec![0u8; cmsg_space];
+        let mut io = libc::iovec {
+            iov_base: "1".as_ptr() as *mut core::ffi::c_void,
+            iov_len: 1,
+        };
+        let mut msg: libc::msghdr = mem::zeroed();
+        msg.msg_iov = &mut io as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = buf.as_mut_ptr() as *mut core::ffi::c_void;
+        msg.msg_controllen = buf.len() as libc::size_t;
+
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            uniperror("CMSG_FIRSTHDR");
+            let _ = libc::close(fd);
+            return -1;
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<i32>() as u32) as libc::size_t;
+
+        let data = libc::CMSG_DATA(cmsg) as *mut i32;
+        ptr::write(data, conn_fd);
+        msg.msg_controllen = libc::CMSG_SPACE(mem::size_of::<i32>() as u32) as libc::size_t;
+
+        if libc::sendmsg(fd, &msg, 0) < 0 {
+            uniperror("sendmsg");
+            let _ = libc::close(fd);
+            return -1;
+        }
+
+        let mut recv_buf = [0u8; 1];
+        if libc::recv(fd, recv_buf.as_mut_ptr().cast::<core::ffi::c_void>(), 1, 0) < 1 {
+            uniperror("recv");
+            let _ = libc::close(fd);
+            return -1;
+        }
+
+        let _ = libc::close(fd);
+        0
+    }
 }
 
-#[cfg(windows)]
+#[cfg(not(target_os = "linux"))]
 fn protect(_conn_fd: i32, _path: *const i8) -> i32 {
     0
 }
