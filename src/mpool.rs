@@ -3,7 +3,7 @@
 // Port of mpool.h / mpool.c.
 // Windows-first: dump_cache/load_cache are left as stubs for now (they depend on inet_ntop/inet_pton + FILE* I/O).
 // Core API is implemented: mem_pool / mem_get / mem_add / mem_delete / mem_destroy.
-// Data structure: simple Vec-based set with the same comparator semantics as C (CMP_BYTES/CMP_BITS/CMP_HOST).
+// Data structure: ordered set with the same comparator semantics as C (CMP_BYTES/CMP_BITS/CMP_HOST).
 //
 // This is intentional for the early “postrочный” phase: it compiles, matches behavior,
 // and we can later swap storage to an AVL/RB tree when needed.
@@ -17,7 +17,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::slice;
 
 use crate::params::{
-    CMP_BITS, CMP_BYTES, CMP_HOST, MF_EXTRA, MF_STATIC, PARAMS, elem, elem_ex, elem_i, mphdr,
+    CMP_BITS, CMP_BYTES, CMP_HOST, ElemPtr, MF_EXTRA, MF_STATIC, PARAMS, elem, elem_ex, elem_i,
+    mphdr,
 };
 
 #[cfg(windows)]
@@ -109,6 +110,38 @@ fn scmp(p: &elem, q: &elem) -> Ordering {
     }
 }
 
+impl PartialEq for ElemPtr {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0 == other.0 {
+            return true;
+        }
+        if self.0.is_null() || other.0.is_null() {
+            return false;
+        }
+        unsafe { scmp(&*self.0, &*other.0) == Ordering::Equal }
+    }
+}
+
+impl Eq for ElemPtr {}
+
+impl PartialOrd for ElemPtr {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ElemPtr {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self.0 == other.0 {
+            return Ordering::Equal;
+        }
+        if self.0.is_null() || other.0.is_null() {
+            return (self.0 as usize).cmp(&(other.0 as usize));
+        }
+        unsafe { scmp(&*self.0, &*other.0) }
+    }
+}
+
 unsafe fn destroy_elem(hdr: *mut mphdr, e: *mut elem) {
     if hdr.is_null() || e.is_null() {
         return;
@@ -173,7 +206,7 @@ pub fn mem_pool(flags: u16, cmp_type: u8) -> *mut mphdr {
     b.cmp_type = cmp_type;
     b.count = 0;
     b.root = ptr::null_mut();
-    b.items = Vec::new();
+    b.items = std::collections::BTreeSet::new();
     b.alloc_kind = 0;
     Box::into_raw(b)
 }
@@ -190,13 +223,9 @@ pub fn mem_get(hdr: *const mphdr, str_: *const i8, len: i32) -> *mut elem {
             cmp_type: (*hdr).cmp_type,
         };
 
-        for &p in (*hdr).items.iter() {
-            if p.is_null() {
-                continue;
-            }
-            if scmp(&temp, &*p) == Ordering::Equal {
-                return p;
-            }
+        let key = ElemPtr(&temp as *const elem as *mut elem);
+        if let Some(found) = (*hdr).items.get(&key) {
+            return found.0;
         }
     }
     ptr::null_mut()
@@ -220,37 +249,33 @@ pub fn mem_add(hdr: *mut mphdr, str_: *mut i8, len: i32, struct_size: usize) -> 
         (*e).cmp_type = (*hdr).cmp_type;
         (*e).data = str_;
 
-        // find existing equivalent
-        let mut existing: *mut elem = ptr::null_mut();
-        for &p in (*hdr).items.iter() {
-            if p.is_null() {
-                continue;
-            }
-            if scmp(&*e, &*p) == Ordering::Equal {
-                existing = p;
-                break;
-            }
-        }
+        let key = ElemPtr(e);
+        let existing = (*hdr).items.get(&key).copied();
 
-        if existing.is_null() {
-            (*hdr).items.push(e);
+        if existing.is_none() {
+            (*hdr).items.insert(key);
             (*hdr).count += 1;
             return e;
         }
 
+        let existing = existing.unwrap();
+
         // C logic:
         // v = insert(); while (e != v && e->len < v->len) { delete(v); v = insert(e); }
         // Here: if new is shorter than existing, delete existing and add new.
-        if (*e).len < (*existing).len {
-            mem_delete(hdr, (*existing).data as *const i8, (*existing).len);
-            (*hdr).items.push(e);
+        if (*e).len < (*existing.0).len {
+            if let Some(removed) = (*hdr).items.take(&existing) {
+                destroy_elem(hdr, removed.0);
+                (*hdr).count = (*hdr).count.saturating_sub(1);
+            }
+            (*hdr).items.insert(key);
             (*hdr).count += 1;
             return e;
         }
 
         // else keep existing, destroy new allocation
         destroy_elem(hdr, e);
-        existing
+        existing.0
     }
 }
 
@@ -267,25 +292,12 @@ pub fn mem_delete(hdr: *mut mphdr, str_: *const i8, len: i32) {
             cmp_type: (*hdr).cmp_type,
         };
 
-        let mut idx: Option<usize> = None;
-        for (i, &p) in (*hdr).items.iter().enumerate() {
-            if p.is_null() {
-                continue;
-            }
-            if scmp(&temp, &*p) == Ordering::Equal {
-                idx = Some(i);
-                break;
-            }
-        }
-
-        let Some(i) = idx else {
+        let key = ElemPtr(&temp as *const elem as *mut elem);
+        let Some(existing) = (*hdr).items.take(&key) else {
             return;
         };
-        let e = (*hdr).items.swap_remove(i);
-        if !e.is_null() {
-            destroy_elem(hdr, e);
-            (*hdr).count = (*hdr).count.saturating_sub(1);
-        }
+        destroy_elem(hdr, existing.0);
+        (*hdr).count = (*hdr).count.saturating_sub(1);
     }
 }
 
@@ -296,9 +308,10 @@ pub fn mem_destroy(hdr: *mut mphdr) {
     }
 
     unsafe {
-        while let Some(e) = (*hdr).items.pop() {
-            if !e.is_null() {
-                destroy_elem(hdr, e);
+        while let Some(e) = (*hdr).items.iter().next().copied() {
+            let e = (*hdr).items.take(&e);
+            if let Some(e) = e {
+                destroy_elem(hdr, e.0);
             }
         }
         let _ = Box::from_raw(hdr);
@@ -325,11 +338,11 @@ pub fn dump_cache(hdr: *mut mphdr, out: &mut dyn Write) -> io::Result<()> {
     };
 
     unsafe {
-        for &p in (*hdr).items.iter() {
-            if p.is_null() {
+        for p in (*hdr).items.iter().copied() {
+            if p.0.is_null() {
                 continue;
             }
-            let item = &*(p as *mut elem_i);
+            let item = &*(p.0 as *mut elem_i);
             if item.main.data.is_null() {
                 continue;
             }
