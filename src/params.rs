@@ -7,6 +7,7 @@
 #![allow(non_camel_case_types)]
 
 use core::{fmt, mem, ptr};
+use std::collections::BTreeSet;
 
 #[cfg(not(windows))]
 use libc::{sockaddr, sockaddr_in, sockaddr_in6};
@@ -129,6 +130,9 @@ pub struct elem {
     // KAVL_HEAD(struct elem) head;  (ignored in Rust port)
 }
 
+#[derive(Clone, Copy)]
+pub struct ElemPtr(pub *mut elem);
+
 #[repr(C)]
 pub struct elem_ex {
     pub main: elem,
@@ -155,7 +159,7 @@ pub struct mphdr {
     pub count: usize,
     pub root: *mut elem, // unused in Rust port (was KAVL root)
     // Rust-only storage:
-    pub items: Vec<*mut elem>,
+    pub items: BTreeSet<ElemPtr>,
     // 0=elem, 1=elem_ex, 2=elem_i (used by destroy_elem)
     pub alloc_kind: u8,
 }
@@ -167,7 +171,7 @@ impl Default for mphdr {
             cmp_type: CMP_BYTES,
             count: 0,
             root: ptr::null_mut(),
-            items: Vec::new(),
+            items: BTreeSet::new(),
             alloc_kind: 0,
         }
     }
